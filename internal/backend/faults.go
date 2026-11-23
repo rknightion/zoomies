@@ -42,6 +42,12 @@ var (
 	// than reported as something left behind. It always travels with
 	// ErrDaemonBusy, so its fault is the busy one.
 	ErrRemovalInProgress = errors.New("backend: the container backend is still removing this container")
+	// ErrBackendConfig is a setting the backend needed and did not get: a value
+	// that does not read back as it was set, or a pool asking for something this
+	// backend will not do. Retrying cannot help, so it is kept apart from
+	// ErrDaemon, which sends an operator to look at the host rather than at
+	// what was configured.
+	ErrBackendConfig = errors.New("backend: the configuration does not allow this")
 )
 
 // noSpace is the daemon's own words for a full disk, and the only evidence
@@ -89,6 +95,8 @@ func Fault(err error) store.FaultKind {
 		return store.FaultContainerConflict
 	case errors.Is(err, ErrImageUnavailable):
 		return store.FaultImage
+	case errors.Is(err, ErrBackendConfig):
+		return store.FaultConfig
 	case errors.Is(err, ErrDaemonBusy):
 		return store.FaultBackendBusy
 	}

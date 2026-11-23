@@ -16,6 +16,12 @@ import (
 	"github.com/eyupio/zoomies/test/fakevmpal"
 )
 
+func TestMain(m *testing.M) {
+	code := m.Run()
+	fakevmpal.CleanUp()
+	os.Exit(code)
+}
+
 type outcome struct {
 	stdout, stderr string
 	code           int

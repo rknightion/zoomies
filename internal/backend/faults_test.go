@@ -73,3 +73,17 @@ func TestADaemonThatTimesOutIsNotADaemonThatIsMissing(t *testing.T) {
 		t.Errorf("a full disk classified as %q, want %q", got, store.FaultOutOfDisk)
 	}
 }
+
+// A setting that does not read back will not read back on a retry, so it must
+// reach the operator as configuration and not as a host to go and look at.
+func TestABackendConfigErrorIsAConfigFault(t *testing.T) {
+	err := fmt.Errorf("creating the runner: %w", fmt.Errorf("%w: clone did not take its settings", ErrBackendConfig))
+	if got := Fault(err); got != store.FaultConfig {
+		t.Fatalf("classified as %q, want %q", got, store.FaultConfig)
+	}
+	// The disk being full stays the more useful thing to say.
+	full := fmt.Errorf("%w: write failed: no space left on device", ErrBackendConfig)
+	if got := Fault(full); got != store.FaultOutOfDisk {
+		t.Fatalf("a full disk classified as %q", got)
+	}
+}

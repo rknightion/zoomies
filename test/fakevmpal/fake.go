@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -142,20 +143,67 @@ type Fake struct {
 // New builds the command into the test's temporary directory.
 func New(t *testing.T) *Fake {
 	t.Helper()
+	built := builtCommand(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vmpal")
+	// A hard link, because the command finds its state beside the path it was
+	// run by, and because a copy written here could still be open in a process
+	// another test is forking at that moment, which fails the exec as busy.
+	if err := os.Link(built, path); err != nil {
+		data, err := os.ReadFile(built)
+		if err != nil {
+			t.Fatalf("fakevmpal: reading the built command: %v", err)
+		}
+		if err := os.WriteFile(path, data, 0o755); err != nil {
+			t.Fatalf("fakevmpal: copying the built command: %v", err)
+		}
+	}
+	return &Fake{t: t, path: path, dir: filepath.Join(dir, "state")}
+}
+
+// build is the command compiled once for this test process. Linking takes over
+// a second, and a suite that needs a clean fake per case would spend minutes on it.
+var build struct {
+	sync.Mutex
+	dir, path string
+}
+
+func builtCommand(t *testing.T) string {
+	t.Helper()
+	build.Lock()
+	defer build.Unlock()
+	if build.path != "" {
+		return build.path
+	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("fakevmpal: cannot locate its own source to find the module root")
 	}
-	root := filepath.Join(filepath.Dir(file), "..", "..")
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp("", "fakevmpal-")
+	if err != nil {
+		t.Fatalf("fakevmpal: %v", err)
+	}
 	path := filepath.Join(dir, "vmpal")
 	cmd := exec.Command("go", "build", "-o", path, "./test/fakevmpal/cmd")
-	cmd.Dir = root
+	cmd.Dir = filepath.Join(filepath.Dir(file), "..", "..")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
+		os.RemoveAll(dir)
 		t.Fatalf("fakevmpal: building the command: %v\n%s", err, out)
 	}
-	return &Fake{t: t, path: path, dir: filepath.Join(dir, "state")}
+	build.dir, build.path = dir, path
+	return path
+}
+
+// CleanUp removes the compiled command. It outlives any one test, so a package
+// using this fake calls it from TestMain.
+func CleanUp() {
+	build.Lock()
+	defer build.Unlock()
+	if build.dir != "" {
+		os.RemoveAll(build.dir)
+		build.dir, build.path = "", ""
+	}
 }
 
 // Path is the command to hand to the backend.
@@ -187,7 +235,7 @@ func (f *Fake) AddTemplate(name string) VM {
 		Installed:    true,
 		AgentControl: true,
 		Tools:        Tools{Latest: true, Version: "0.42"},
-		Settings:     defaultSettings(name),
+		Settings:     defaultSettings(),
 	})
 	vm, _ := f.VM(name)
 	return vm
@@ -213,7 +261,7 @@ func (f *Fake) AddVM(vm VM) {
 			vm.Guest = "macOS"
 		}
 		if vm.Settings == nil {
-			vm.Settings = defaultSettings(vm.Name)
+			vm.Settings = defaultSettings()
 		}
 		s.VMs = append(s.VMs, vm)
 	})
@@ -342,7 +390,7 @@ func (f *Fake) Execs() []ExecCall {
 
 // ---- state ----
 
-func defaultSettings(name string) map[string]any {
+func defaultSettings() map[string]any {
 	return map[string]any{
 		"agentControl":     true,
 		"bluetooth":        false,
@@ -356,11 +404,11 @@ func defaultSettings(name string) map[string]any {
 		"forwardedPorts":   []any{},
 		"gpuAcceleration":  false,
 		"localNetwork":     "default",
-		"location":         "/var/vmpal/" + name,
+		"location":         false,
 		"memoryGB":         8,
 		"microphone":       false,
 		"naturalScrolling": false,
-		"network":          "nat",
+		"network":          true,
 		"networkMode":      "default",
 		"sharedFolders":    []any{},
 		"speakers":         true,
@@ -648,7 +696,7 @@ func effective(st *state, vm VM) VM {
 		mode, card = vm.SessionHardware.NetworkMode, vm.SessionHardware.LocalNetworkCard
 	}
 	s["networkModeInEffect"] = mode
-	s["localNetworkInEffect"] = map[bool]string{true: "on", false: "off"}[card]
+	s["localNetworkInEffect"] = card
 	s["bridgedInterfaceInEffect"] = nil
 	if mode == "bridged" {
 		s["bridgedInterfaceInEffect"] = "en0"
@@ -696,9 +744,6 @@ func cmdClone(st *state, args []string) result {
 	c.ID, c.Name = st.newID(), name
 	c.State, c.InternetAddress, c.SessionHardware, c.PendingSettings = "stopped", "", nil, nil
 	c.Tools.Connected = false
-	if loc, ok := c.Settings["location"].(string); ok {
-		c.Settings["location"] = filepath.Join(filepath.Dir(loc), name)
-	}
 	st.VMs = append(st.VMs, c)
 	if p.flags["-q"] {
 		return result{out: c.ID + "\n"}

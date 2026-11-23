@@ -986,9 +986,14 @@ func (b *ProcessBackend) download(ctx context.Context, url, asset string) (strin
 // verify checks the archive against a digest we know, and refuses to install an
 // unverified one unless the operator has said that is acceptable.
 func (b *ProcessBackend) verify(path, version, asset string) error {
-	want := b.sha256
-	if want == "" {
-		want = knownRunnerSHA256[version+"/"+asset]
+	// Every version is passed as the configured one: this backend has always
+	// held whatever a pool pins to agent.runner_sha256, so a pool pinning a
+	// different release is refused for not matching. Scoping the digest here
+	// would turn that refusal into an unverified install on a host that allows
+	// them.
+	want, _, err := resolveRunnerDigest(runtime.GOOS, runtime.GOARCH, version, b.sha256, version)
+	if err != nil {
+		return err
 	}
 	if want == "" {
 		if !b.allowUnverified {
@@ -1013,6 +1018,22 @@ func (b *ProcessBackend) verify(path, version, asset string) error {
 		return fmt.Errorf("backend: %s does not match its expected SHA-256 (got %s, want %s); the download was corrupted or tampered with -- it has not been installed", asset, got, want)
 	}
 	return nil
+}
+
+// resolveRunnerDigest is the SHA-256 a runner archive must match, and the name
+// of that archive. An operator's configured digest answers for configuredVersion
+// only, because one digest cannot describe two releases; any other version
+// falls back to the table of digests this build ships. An empty digest means
+// nothing is known, and what to do about that is the caller's decision.
+func resolveRunnerDigest(goos, goarch, version, configured, configuredVersion string) (digest, asset string, err error) {
+	asset, err = runnerAsset(goos, goarch, version)
+	if err != nil {
+		return "", "", err
+	}
+	if configured != "" && version == configuredVersion {
+		return configured, asset, nil
+	}
+	return knownRunnerSHA256[version+"/"+asset], asset, nil
 }
 
 // runnerAsset names the release archive for a host, or explains why there is
@@ -1331,27 +1352,7 @@ func writeMeta(dir string, m processMeta) error {
 	if err != nil {
 		return fmt.Errorf("backend: encoding runner metadata: %w", err)
 	}
-	tmp, err := os.CreateTemp(dir, "metadata-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err = tmp.Chmod(0640); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err = tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err = tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp.Name(), filepath.Join(dir, runnerMetaFile)); err != nil {
+	if err := writeFileAtomic(filepath.Join(dir, runnerMetaFile), b, 0o640); err != nil {
 		return fmt.Errorf("backend: writing runner metadata in %s: %w", dir, err)
 	}
 	return nil

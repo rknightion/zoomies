@@ -226,7 +226,7 @@ jobs:
               # runner image. The installer job lints them; the cleanup scripts
               # are also prose to internal/docs, as everything under .github/ is.
               .github/scripts/*) installer=true; docs=true ;;
-              internal/backend/toolfill.sh) go=true; installer=true ;;
+              internal/backend/toolfill.sh|internal/backend/vmpal_guest.sh) go=true; installer=true ;;
               # Prose, and the workflows. internal/docs tests the problem-code
               # table, the README, the workflows and the roadmap against the
               # code, and internal/naming the image table; those two packages
@@ -1394,6 +1394,9 @@ jobs:
           done
           # Run inside the runner image by bash, and embedded in the binary.
           shellcheck internal/backend/toolfill.sh
+          # Run inside every macOS guest by its /bin/sh, and embedded in the binary.
+          dash -n internal/backend/vmpal_guest.sh
+          shellcheck -s sh internal/backend/vmpal_guest.sh
 
       - name: RPM package install recovery
         run: dash test/runner-image/dnf-check.sh
