@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -62,6 +63,12 @@ const (
 	// vmpalMacOSLimit is Apple's limit on macOS VMs running on one Mac, counting
 	// those of every other app.
 	vmpalMacOSLimit = 2
+	// vmpalFinalRead bounds the one look at a guest's exit record that a removal
+	// makes. The clone is being deleted either way, so it must not wait long.
+	vmpalFinalRead = 3 * time.Second
+	// vmpalSpentKeep is how long a runner stays refused after its registration
+	// was sent, which is far longer than a redelivered create can arrive.
+	vmpalSpentKeep = 24 * time.Hour
 	// vmpalDefaultBinary is where VMPal installs its command.
 	vmpalDefaultBinary = "/usr/local/bin/vmpal"
 )
@@ -170,6 +177,7 @@ type VMPalBackend struct {
 	mustAllow   []string
 	mustBlock   []string
 	policyCheck string
+	spentDir    string
 	installID   string
 	version     string
 	sha256      string
@@ -191,7 +199,15 @@ type VMPalBackend struct {
 	creating map[string]bool
 	watchers map[string]*vmpalWatcher
 	slots    map[string]*vmpalSlots
-	closed   bool
+	// removing is the clones the agent has asked to have deleted, until they
+	// have gone. It lasts across the retries of a slow delete, and it is memory
+	// on purpose: after a restart nobody is known to have asked.
+	removing map[string]bool
+	// forcedOff is the clones this process turned off itself, so that a VM seen
+	// stopped before its result could be written is not taken for a guest that
+	// powered itself off.
+	forcedOff map[string]bool
+	closed    bool
 
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
@@ -204,6 +220,7 @@ type VMPalBackend struct {
 	removeEvery time.Duration
 	logPoll     time.Duration
 	addressWait time.Duration
+	finalRead   time.Duration
 }
 
 var (
@@ -242,6 +259,10 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 	root := filepath.Join(work, "vmpal")
 	clones := filepath.Join(root, "clones")
 	if err := os.MkdirAll(clones, 0o700); err != nil {
+		return nil, fmt.Errorf("backend: creating the VM state directory: %w", err)
+	}
+	spentDir := filepath.Join(root, "spent")
+	if err := os.MkdirAll(spentDir, 0o700); err != nil {
 		return nil, fmt.Errorf("backend: creating the VM state directory: %w", err)
 	}
 	installID, err := loadVMPalInstallID(root)
@@ -285,6 +306,7 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 		mustAllow:   slices.Clone(opts.EgressMustAllow),
 		mustBlock:   slices.Clone(opts.EgressMustBlock),
 		policyCheck: strings.TrimSpace(opts.PolicyCheck),
+		spentDir:    spentDir,
 		installID:   installID,
 		version:     version,
 		sha256:      strings.ToLower(strings.TrimSpace(opts.RunnerSHA256)),
@@ -296,6 +318,8 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 		creating:    make(map[string]bool),
 		watchers:    make(map[string]*vmpalWatcher),
 		slots:       make(map[string]*vmpalSlots),
+		removing:    make(map[string]bool),
+		forcedOff:   make(map[string]bool),
 		baseCtx:     ctx,
 		baseCancel:  cancel,
 		watchEvery:  vmpalWatchEvery,
@@ -304,6 +328,7 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 		removeEvery: vmpalRemoveEvery,
 		logPoll:     vmpalLogPoll,
 		addressWait: vmpalAddressWait,
+		finalRead:   vmpalFinalRead,
 	}
 	if b.gate == nil {
 		b.gate = b.policyGate(opts, filepath.Join(root, "state.json"))
@@ -370,7 +395,9 @@ func (b *VMPalBackend) advance(name string, stage vmpalStage, change func(*vmpal
 	if err != nil {
 		return err
 	}
-	if !ok || e.Stage == vmpalStageDeleting {
+	// removing as well as the stage, because on a full disk the stage may never
+	// have been written.
+	if !ok || e.Stage == vmpalStageDeleting || b.removing[name] {
 		return fmt.Errorf("backend: clone %s is being deleted, so its create was abandoned", name)
 	}
 	if stage.rank() > e.Stage.rank() {
@@ -647,6 +674,13 @@ func (b *VMPalBackend) admit(ctx context.Context, name string, spec Spec) error 
 	b.admitMu.Lock()
 	defer b.admitMu.Unlock()
 
+	b.pruneSpent()
+	if spent, err := b.runnerSpent(spec.RunnerID); err != nil {
+		return err
+	} else if spent {
+		return fmt.Errorf("%w: runner %s has already been sent its registration, which works only once; the controller should start a new runner", ErrContainerConflict, spec.RunnerID)
+	}
+
 	vms, err := b.cli.List(ctx)
 	if err != nil {
 		return err
@@ -686,6 +720,59 @@ func (b *VMPalBackend) admit(ctx context.Context, name string, spec Spec) error 
 	return err
 }
 
+// A spent marker says a runner's registration may have left this host. The
+// ledger entry cannot say so for long, because it goes with the clone, and a
+// create redelivered after a lease expiry would then send the same registration
+// to a new guest. The marker's modification time is when it was spent.
+func (b *VMPalBackend) spentPath(runnerID string) string {
+	return filepath.Join(b.spentDir, runnerID)
+}
+
+func (b *VMPalBackend) markSpent(runnerID string) error {
+	path := b.spentPath(runnerID)
+	if err := writeFileAtomic(path, nil, 0o600); err != nil {
+		return fmt.Errorf("backend: recording that a registration is being used, in %s: %w", b.spentDir, err)
+	}
+	now := b.now()
+	if err := os.Chtimes(path, now, now); err != nil {
+		return fmt.Errorf("backend: recording that a registration is being used, in %s: %w", b.spentDir, err)
+	}
+	return nil
+}
+
+func (b *VMPalBackend) runnerSpent(runnerID string) (bool, error) {
+	_, err := os.Stat(b.spentPath(runnerID))
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	}
+	// Not knowing is not the same as not spent, and the cost of refusing is one
+	// runner the controller replaces.
+	return false, fmt.Errorf("backend: checking whether a registration was already used, in %s: %w", b.spentDir, err)
+}
+
+// pruneSpent drops markers past the point where a redelivered create could
+// still arrive. A failure here only leaves a small file for the next pass.
+func (b *VMPalBackend) pruneSpent() {
+	files, err := os.ReadDir(b.spentDir)
+	if err != nil {
+		b.log.Warn("could not read the used-registration markers", "dir", b.spentDir, "error", err)
+		return
+	}
+	now := b.now()
+	for _, f := range files {
+		info, err := f.Info()
+		if err != nil || now.Sub(info.ModTime()) <= vmpalSpentKeep {
+			continue
+		}
+		if err := os.Remove(filepath.Join(b.spentDir, f.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			b.log.Warn("could not remove an old used-registration marker", "file", f.Name(), "error", err)
+		}
+	}
+}
+
 func (b *VMPalBackend) endCreate(name string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -723,6 +810,8 @@ func (b *VMPalBackend) provision(ctx context.Context, name string, spec Spec, so
 	if err := b.verify(ctx, name); err != nil {
 		return err
 	}
+	// Without its monotonic reading, which stops while a Mac sleeps.
+	verifiedAt := b.now().Round(0)
 	if err := b.advance(name, vmpalStageArming, nil); err != nil {
 		return err
 	}
@@ -736,9 +825,20 @@ func (b *VMPalBackend) provision(ctx context.Context, name string, spec Spec, so
 		return fmt.Errorf("backend: preparing the runner in the guest: %w", err)
 	}
 
+	// The egress result describes the network as it was when it was taken, and
+	// the watcher that notices a sleep does not start until after this.
+	if gap := b.now().Round(0).Sub(verifiedAt); gap > vmpalWakeGap {
+		return fmt.Errorf("backend: the Mac was asleep or stalled for %s after this clone's network check, so the check no longer counts; the clone is being deleted and nothing was delivered, and the Mac should be kept from sleeping", gap.Round(time.Second))
+	}
+
 	// Recorded before the credential moves. From here a restarted agent treats
 	// the registration as spent, whether or not it arrived.
 	if err := b.advance(name, vmpalStageDelivering, nil); err != nil {
+		return err
+	}
+	// This one outlives the clone. If it cannot be written the registration is
+	// not sent, because nothing would then stop it being sent a second time.
+	if err := b.markSpent(spec.RunnerID); err != nil {
 		return err
 	}
 	deliverCtx, cancelDeliver := context.WithTimeout(ctx, vmpalDeliverLimit)
@@ -967,15 +1067,24 @@ func (b *VMPalBackend) sessionProblems(info vmpalInfo) []string {
 		if hw.NetworkMode != "shared" {
 			problems = append(problems, "the session's network mode is not shared")
 		}
-		if hw.LocalNetworkCard {
+		switch {
+		case hw.LocalNetworkCard == nil:
+			problems = append(problems, "the session does not say whether it has a local network card")
+		case *hw.LocalNetworkCard:
 			problems = append(problems, "the session has a local network card")
 		}
-		if hw.BridgedInterface != nil {
+		switch {
+		case hw.BridgedInterface == nil:
+			problems = append(problems, "the session does not say whether it is bridged")
+		case string(hw.BridgedInterface) != "null":
 			problems = append(problems, "the session is bridged")
 		}
 		problems = append(problems, b.sessionSizeProblems(hw)...)
 	}
-	if len(info.PendingSettings) != 0 {
+	switch {
+	case info.PendingSettings == nil:
+		problems = append(problems, "the VM does not report its pending settings")
+	case len(info.PendingSettings) != 0:
 		problems = append(problems, "the VM has settings waiting for its next start")
 	}
 	ip := net.ParseIP(info.InternetAddress)
@@ -1074,7 +1183,7 @@ func (b *VMPalBackend) Status(ctx context.Context, h Handle) (Status, error) {
 	vm, present := findVMPalVM(vms, name)
 	b.mu.Lock()
 	e, ok, err := b.ledger.read(name)
-	creating := b.creating[name]
+	creating, removing := b.creating[name], b.removing[name]
 	b.mu.Unlock()
 	if err != nil {
 		return Status{}, err
@@ -1085,7 +1194,36 @@ func (b *VMPalBackend) Status(ctx context.Context, h Handle) (Status, error) {
 		}
 		e = b.unledgeredEntry(vm)
 	}
-	return vmpalStatus(e, vm, present, creating), nil
+	st := vmpalStatus(e, vm, present, creating, removing)
+	b.noteGuestPowerOff(e, vm, st)
+	return st, nil
+}
+
+// noteGuestPowerOff feeds the breaker for a clone that went off with its runner
+// up and nobody having asked. Nothing in the guest can say how that runner
+// ended, and a template that dies after registering would otherwise register
+// without limit.
+func (b *VMPalBackend) noteGuestPowerOff(e vmpalEntry, vm vmpalVM, st Status) {
+	if e.Exit != nil || vm.State != "stopped" || st.Phase != PhaseFailed || st.Message != vmpalMsgVMStopped {
+		return
+	}
+	// Read again under the lock: the entry above can be from before a stop
+	// request, and that stop is what would have turned the VM off.
+	b.mu.Lock()
+	e, ok, err := b.ledger.read(vm.Name)
+	if err != nil || !ok || e.Exit != nil || !e.StopRequestedAt.IsZero() || e.Stage == vmpalStageDeleting ||
+		e.Stage.preparing() || b.creating[vm.Name] || b.removing[vm.Name] || b.forcedOff[vm.Name] {
+		b.mu.Unlock()
+		return
+	}
+	err = b.writeExitLocked(e, PhaseFailed, 1, vmpalMsgVMStopped)
+	b.mu.Unlock()
+	if err != nil {
+		// Not counted, so the next pass can try again without counting it twice.
+		b.log.Warn("could not record that a clone powered off", "vm", vm.Name, "error", err)
+		return
+	}
+	b.gate.RunnerExited(false, false)
 }
 
 func findVMPalVM(vms []vmpalVM, name string) (vmpalVM, bool) {
@@ -1148,9 +1286,18 @@ func (b *VMPalBackend) List(ctx context.Context) ([]Workload, error) {
 		return nil, err
 	}
 
+	b.dropRemoved(entries, vms)
+	b.mu.Lock()
+	removing := make(map[string]bool, len(b.removing))
+	for name := range b.removing {
+		removing[name] = true
+	}
+	b.mu.Unlock()
+
 	out := make([]Workload, 0, len(entries))
 	add := func(e vmpalEntry, vm vmpalVM, present, inFlight bool) {
-		st := vmpalStatus(e, vm, present, inFlight)
+		st := vmpalStatus(e, vm, present, inFlight, removing[e.VMName])
+		b.noteGuestPowerOff(e, vm, st)
 		out = append(out, Workload{
 			Handle: Handle(e.VMName), Name: firstNonEmpty(e.RunnerName, e.VMName),
 			RunnerID: e.RunnerID, PoolID: e.PoolID, Status: st,
@@ -1176,6 +1323,22 @@ func (b *VMPalBackend) List(ctx context.Context) ([]Workload, error) {
 	}
 	slices.SortFunc(out, func(x, y Workload) int { return strings.Compare(string(x.Handle), string(y.Handle)) })
 	return out, nil
+}
+
+// dropRemoved forgets records whose removal finished after the ledger was read.
+// Their VM has gone from the later list, and without this they would be reported
+// as a clone lost from under a job that this agent has just finished removing.
+func (b *VMPalBackend) dropRemoved(entries map[string]vmpalEntry, vms []vmpalVM) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for name := range entries {
+		if _, present := findVMPalVM(vms, name); present {
+			continue
+		}
+		if _, ok, err := b.ledger.read(name); err == nil && !ok {
+			delete(entries, name)
+		}
+	}
 }
 
 // Stats returns nothing: the host cannot see inside a guest's use of its slot.
@@ -1403,7 +1566,35 @@ func (b *VMPalBackend) Remove(ctx context.Context, h Handle) error {
 		return errVMPalNotOurs(name)
 	}
 	b.stopWatcher(name)
+	b.readFinalExit(ctx, name)
+	// Only now: until the record has been read, calling this runner finished
+	// could report a clean exit for a job that failed.
+	b.mu.Lock()
+	b.removing[name] = true
+	b.mu.Unlock()
 	return b.removeClone(ctx, name)
+}
+
+// readFinalExit makes one bounded attempt to learn how a runner ended before
+// its clone goes. On the normal path the controller's remove gets here before
+// the watcher's next tick, and without this a real job would rarely clear the
+// breaker. readGuestExit stores the first account only, so a watcher read in
+// flight cannot make it count twice. No answer is not evidence that no job ran,
+// so a failed read counts for nothing and the delete goes ahead.
+func (b *VMPalBackend) readFinalExit(ctx context.Context, name string) {
+	b.mu.Lock()
+	e, ok, err := b.ledger.read(name)
+	creating := b.creating[name]
+	b.mu.Unlock()
+	if err != nil || !ok || creating || e.Exit != nil ||
+		(e.Stage != vmpalStageDelivering && e.Stage != vmpalStageRunning) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.finalRead)
+	defer cancel()
+	if _, err := b.readGuestExit(ctx, name, b.finalRead); err != nil {
+		b.log.Info("could not read a runner's exit record before deleting its clone", "vm", name, "error", err)
+	}
 }
 
 func (b *VMPalBackend) removeClone(ctx context.Context, name string) error {
@@ -1417,9 +1608,19 @@ func (b *VMPalBackend) removeClone(ctx context.Context, name string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.slots, name)
-	return b.ledger.remove(name)
+	if err := b.ledger.remove(name); err != nil {
+		return err
+	}
+	delete(b.removing, name)
+	delete(b.forcedOff, name)
+	return nil
 }
 
+// markDeleting records that a clone is going. A failed write is logged and does
+// not stop it: losing this record costs one repeated delete, and refusing would
+// mean a full disk keeps an untrusted guest running, even through a breach purge.
+// A failed read is still an error, because the record holds the ID that shows
+// the VM is the clone this agent made.
 func (b *VMPalBackend) markDeleting(name string) (vmpalEntry, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1431,7 +1632,7 @@ func (b *VMPalBackend) markDeleting(name string) (vmpalEntry, bool, error) {
 		e.Stage = vmpalStageDeleting
 		e.UpdatedAt = b.now()
 		if err := b.ledger.write(e); err != nil {
-			return e, true, err
+			b.log.Warn("could not record that a clone is being deleted; deleting it anyway", "vm", name, "error", err)
 		}
 	}
 	return e, true, nil
@@ -1458,7 +1659,7 @@ func (b *VMPalBackend) deleteVM(ctx context.Context, name string, e vmpalEntry, 
 	if !known || e.DeleteIssuedAt.IsZero() || b.now().Sub(e.DeleteIssuedAt) >= vmpalDeleteAgain {
 		if known {
 			if err := b.markDeleteIssued(name); err != nil {
-				return err
+				b.log.Warn("could not record that a delete was issued; it may be issued again", "vm", name, "error", err)
 			}
 		}
 		if err := b.cli.Delete(ctx, name); err != nil {

@@ -88,6 +88,9 @@ var vmpalRunnerID = regexp.MustCompile(`^run_[A-Za-z0-9]+$`)
 // both be making one.
 type vmpalLedger struct {
 	dir string
+	// writeFile is how a record reaches the disk. Nil means writeFileAtomic; a
+	// test sets it, because a read-only directory stops nothing when run as root.
+	writeFile func(path string, data []byte, mode os.FileMode) error
 }
 
 func (l *vmpalLedger) path(name string) string {
@@ -124,7 +127,11 @@ func (l *vmpalLedger) write(e vmpalEntry) error {
 	if err != nil {
 		return fmt.Errorf("backend: encoding the VM ledger: %w", err)
 	}
-	if err := writeFileAtomic(l.path(e.VMName), data, 0o600); err != nil {
+	store := l.writeFile
+	if store == nil {
+		store = writeFileAtomic
+	}
+	if err := store(l.path(e.VMName), data, 0o600); err != nil {
 		return fmt.Errorf("backend: writing the VM ledger in %s: %w", l.dir, err)
 	}
 	return nil
@@ -222,7 +229,7 @@ const (
 
 // vmpalStatus is the recovery table: what one ledger record and the VM it names
 // mean, reading nothing from the guest.
-func vmpalStatus(e vmpalEntry, vm vmpalVM, present, creating bool) Status {
+func vmpalStatus(e vmpalEntry, vm vmpalVM, present, creating, removing bool) Status {
 	st := Status{Handle: Handle(e.VMName), StartedAt: e.StartedAt}
 	if st.StartedAt.IsZero() {
 		st.StartedAt = e.CreatedAt
@@ -237,6 +244,10 @@ func vmpalStatus(e vmpalEntry, vm vmpalVM, present, creating bool) Status {
 		st.Phase = PhaseStarting
 	case e.Exit != nil:
 		st.Phase, st.ExitCode, st.Message, st.ExitedAt = e.Exit.Phase, e.Exit.Code, e.Exit.Message, e.Exit.At
+	case removing:
+		// The agent asked for this delete, so its progress is not a runner
+		// failing, and reporting it as one could record a lost job.
+		st.Phase = PhaseExited
 	case !present && stopped:
 		st.Phase = PhaseGone
 	case !present:

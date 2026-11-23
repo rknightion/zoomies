@@ -89,9 +89,13 @@ type vmpalVM struct {
 // vmpalSessionHardware is what a running VM actually has, as opposed to the
 // settings it will have at its next start.
 type vmpalSessionHardware struct {
-	NetworkMode      string  `json:"networkMode"`
-	LocalNetworkCard bool    `json:"localNetworkCard"`
-	BridgedInterface *string `json:"bridgedInterface"`
+	NetworkMode string `json:"networkMode"`
+	// A pointer and a raw value, because absent has to differ from the safe
+	// answer: a release that stops reporting one of these has not shown that
+	// the clone is isolated. BridgedInterface holds the literal null when the
+	// field is there and empty, and nothing at all when it is missing.
+	LocalNetworkCard *bool           `json:"localNetworkCard"`
+	BridgedInterface json.RawMessage `json:"bridgedInterface"`
 	// Pointers, so a release that stops reporting the size reads as unknown
 	// rather than as zero. Floats, so a fractional size fails the comparison
 	// rather than failing to decode the whole answer.
@@ -122,13 +126,19 @@ func (c *vmpalCLI) List(ctx context.Context) ([]vmpalVM, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A pointer, because an answer with no list says nothing about what is on
+	// the Mac. Read as an empty list it would make every clone look gone, and a
+	// live job would be reaped for it.
 	var doc struct {
-		VMs []vmpalVM `json:"vms"`
+		VMs *[]vmpalVM `json:"vms"`
 	}
 	if err := decodeVMPal(out, "list", &doc); err != nil {
 		return nil, err
 	}
-	return doc.VMs, nil
+	if doc.VMs == nil {
+		return nil, &vmpalCallError{Command: "list", Detail: "its output had no list of VMs; check that this version of VMPal is supported"}
+	}
+	return *doc.VMs, nil
 }
 
 // Info returns one VM in full.

@@ -135,9 +135,8 @@ func TestShortRealJobsNeverTripTheBreaker(t *testing.T) {
 		if err != nil {
 			t.Fatalf("job %d: %v", i, err)
 		}
-		if finished, err := r.b.readGuestExit(context.Background(), string(h), time.Second); err != nil || !finished {
-			t.Fatalf("job %d: finished=%v, %v", i, finished, err)
-		}
+		// No read by hand: on the normal path the controller's remove arrives
+		// before the watcher's next tick, and Remove has to do it.
 		if err := r.b.Remove(context.Background(), h); err != nil {
 			t.Fatal(err)
 		}

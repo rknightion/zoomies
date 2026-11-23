@@ -99,10 +99,12 @@ func (b *VMPalBackend) watchOnce(ctx context.Context, name string, st *vmpalWatc
 	if !st.lastTick.IsZero() {
 		gap = now.Sub(st.lastTick)
 	}
-	st.lastTick = now
 	if gap > vmpalWakeGap {
+		// lastTick stays where it was, so that if the result cannot be written
+		// the next look still sees this gap.
 		return b.endWatch(name, fmt.Sprintf("the Mac was asleep or stalled for %s while this runner was up, so whether its network policy held is unknown; the clone is being deleted, and the Mac should be kept from sleeping", gap.Round(time.Second)))
 	}
+	st.lastTick = now
 	started := e.StartedAt
 	if started.IsZero() {
 		started = e.CreatedAt
@@ -128,28 +130,47 @@ func (b *VMPalBackend) watchOnce(ctx context.Context, name string, st *vmpalWatc
 	return finished
 }
 
-// endWatch records a runner's end when nothing in the guest said how it ended,
-// and leaves the delete to the agent, which removes a workload once the
-// controller has heard about it.
+// endWatch records a runner's end when nothing in the guest said how it ended
+// and turns the VM off. The delete stays with the agent, which removes a
+// workload once the controller has heard about it, but a clone that is not being
+// resumed must not go on running a job until then.
 func (b *VMPalBackend) endWatch(name, message string) bool {
-	if err := b.recordExit(name, PhaseFailed, 1, message); err != nil {
-		b.log.Warn("could not record a runner's end; trying again", "vm", name, "error", err)
+	err := b.recordExit(name, PhaseFailed, 1, message)
+	return b.finishEnding(name, message, err)
+}
+
+// finishEnding forces the VM off whether or not the result could be written,
+// because a full disk is no reason to leave it running.
+func (b *VMPalBackend) finishEnding(name, message string, recordErr error) bool {
+	b.forceOff(name)
+	if recordErr != nil {
+		b.log.Warn("could not record a runner's end; trying again", "vm", name, "error", recordErr)
 		return false
 	}
 	b.log.Warn("ending a macOS VM runner", "vm", name, "reason", message)
 	return true
 }
 
+// forceOff runs on a context of its own: the watcher's is cancelled when the
+// agent shuts down, and this clone is not one to leave running through that.
+func (b *VMPalBackend) forceOff(name string) {
+	b.mu.Lock()
+	b.forcedOff[name] = true
+	b.mu.Unlock()
+	if err := b.cli.Stop(context.Background(), name, vmpalForceOffLimit); err != nil {
+		b.mu.Lock()
+		delete(b.forcedOff, name)
+		b.mu.Unlock()
+		b.log.Warn("could not force off a clone that is being ended; it keeps running until it is deleted", "vm", name, "error", err)
+	}
+}
+
 // endUnfollowable is endWatch for a runner the guest stopped reporting on. No
 // job is known to have run, so it counts toward the breaker: a guest broken the
 // same way each time would otherwise register without limit.
 func (b *VMPalBackend) endUnfollowable(name, message string) bool {
-	if err := b.recordUnreadableExit(name, message); err != nil {
-		b.log.Warn("could not record a runner's end; trying again", "vm", name, "error", err)
-		return false
-	}
-	b.log.Warn("ending a macOS VM runner", "vm", name, "reason", message)
-	return true
+	err := b.recordUnreadableExit(name, message)
+	return b.finishEnding(name, message, err)
 }
 
 // recordUnreadableExit stores a failed end for a runner whose guest gave no
