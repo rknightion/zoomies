@@ -17,8 +17,9 @@ type vmpalSlotUse struct {
 
 func (u vmpalSlotUse) total() int { return u.Own + len(u.Foreign) }
 
-// vmpalSlotLimit is how many VMs this agent may count up to. Apple's limit
-// applies whatever the configuration says.
+// vmpalSlotLimit is how many clones of its own this agent may hold. Apple's
+// limit covers the whole Mac and is checked separately, so a VM somebody else
+// runs takes one of Apple's slots and none of this agent's allowance.
 func vmpalSlotLimit(maxVMs int) int { return min(maxVMs, vmpalMacOSLimit) }
 
 // vmpalForeignHoldsSlot reports whether a VM this agent does not manage takes
@@ -52,8 +53,8 @@ func countVMPalSlots(vms []vmpalVM, entries map[string]vmpalEntry, owned func(st
 // even when other people's VMs are the cause: it is a reason to wait, and the
 // agent retries it with a backoff.
 func (u vmpalSlotUse) admit(limit int) error {
-	if u.total() < limit {
+	if u.Own < limit && u.total() < vmpalMacOSLimit {
 		return nil
 	}
-	return busyErr(fmt.Errorf("this Mac has no free VM slot: %d of %d are in use, %d by this agent and %d by VMs Zoomies does not manage", u.total(), limit, u.Own, len(u.Foreign)))
+	return busyErr(fmt.Errorf("this Mac has no free VM slot: this agent holds %d of the %d it may use, and with %d VMs Zoomies does not manage the Mac is at %d of Apple's %d", u.Own, limit, len(u.Foreign), u.total(), vmpalMacOSLimit))
 }

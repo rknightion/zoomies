@@ -68,7 +68,7 @@ func TestACreateWithNoFreeSlotIsBusyAndMakesNoClone(t *testing.T) {
 		own     bool
 		foreign int
 	}{
-		{"one slot held by a foreign VM", 1, false, 1},
+		{"Apple's limit reached by foreign VMs, with one clone allowed", 1, false, 2},
 		{"one slot held by this agent", 1, true, 0},
 		{"two slots held by foreign VMs", 2, false, 2},
 		{"two slots shared with a foreign VM", 2, true, 1},
@@ -96,6 +96,16 @@ func TestACreateWithNoFreeSlotIsBusyAndMakesNoClone(t *testing.T) {
 				t.Error("the credential reached a guest")
 			}
 		})
+	}
+}
+
+// max_vms limits this agent's own clones. Reading it as the whole Mac's limit
+// parks a host that has a free slot whenever anything else runs a VM.
+func TestAClonedRunnerCanRunBesideAVMZoomiesDoesNotManage(t *testing.T) {
+	r := newEgressRig(t, 1)
+	r.fake.AddVM(fakevmpal.VM{Name: "foreign-0", State: "running", Installed: true})
+	if _, err := r.b.Create(context.Background(), vmpalTestSpec("run_beside")); err != nil {
+		t.Fatalf("create beside one foreign VM: %v", err)
 	}
 }
 
@@ -194,7 +204,8 @@ func TestProbeIsUnavailableOnlyWhenForeignVMsHoldEverySlot(t *testing.T) {
 		{"one of each", 2, 1, 1, true},
 		{"one foreign VM of two slots", 2, 0, 1, true},
 		{"foreign VMs in both slots", 2, 0, 2, false},
-		{"a foreign VM in the only slot", 1, 0, 1, false},
+		{"one clone allowed beside a foreign VM", 1, 0, 1, true},
+		{"foreign VMs at Apple's limit, with one clone allowed", 1, 0, 2, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newEgressRig(t, tc.maxVMs)

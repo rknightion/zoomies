@@ -539,8 +539,8 @@ func (b *VMPalBackend) Probe(ctx context.Context) Info {
 	}
 	// Only other people's VMs can make this host unavailable. Its own clones
 	// filling every slot is a busy host doing its job.
-	if foreign := countVMPalSlots(vms, nil, b.ownedRunner).Foreign; len(foreign) >= vmpalSlotLimit(b.maxVMs) {
-		return refuse(fmt.Sprintf("%s %d of this host's VM slots (%s); shut one down to free a slot", VMPalSlotsOccupiedDetail, vmpalSlotLimit(b.maxVMs), strings.Join(foreign, ", ")))
+	if foreign := countVMPalSlots(vms, nil, b.ownedRunner).Foreign; len(foreign) >= vmpalMacOSLimit {
+		return refuse(fmt.Sprintf("%s %d of this host's VM slots (%s); shut one down to free a slot", VMPalSlotsOccupiedDetail, vmpalMacOSLimit, strings.Join(foreign, ", ")))
 	}
 	template, err := b.cli.Info(ctx, b.template)
 	if err != nil {
