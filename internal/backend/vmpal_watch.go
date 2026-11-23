@@ -120,7 +120,7 @@ func (b *VMPalBackend) watchOnce(ctx context.Context, name string, st *vmpalWatc
 			st.failingSince = now
 		}
 		if now.Sub(st.failingSince) >= vmpalReadGiveUp {
-			return b.endWatch(name, fmt.Sprintf("VMPal Tools in the guest did not answer for %s, so the runner cannot be followed; the clone is being deleted", vmpalReadGiveUp))
+			return b.endUnfollowable(name, fmt.Sprintf("VMPal Tools in the guest did not answer for %s, so the runner cannot be followed; the clone is being deleted", vmpalReadGiveUp))
 		}
 		return false
 	}
@@ -140,6 +140,37 @@ func (b *VMPalBackend) endWatch(name, message string) bool {
 	return true
 }
 
+// endUnfollowable is endWatch for a runner the guest stopped reporting on. No
+// job is known to have run, so it counts toward the breaker: a guest broken the
+// same way each time would otherwise register without limit.
+func (b *VMPalBackend) endUnfollowable(name, message string) bool {
+	if err := b.recordUnreadableExit(name, message); err != nil {
+		b.log.Warn("could not record a runner's end; trying again", "vm", name, "error", err)
+		return false
+	}
+	b.log.Warn("ending a macOS VM runner", "vm", name, "reason", message)
+	return true
+}
+
+// recordUnreadableExit stores a failed end for a runner whose guest gave no
+// usable account of it, and tells the breaker that no job is known to have run.
+func (b *VMPalBackend) recordUnreadableExit(name, message string) error {
+	b.mu.Lock()
+	e, ok, err := b.ledger.read(name)
+	if err != nil || !ok || e.Exit != nil {
+		b.mu.Unlock()
+		return err
+	}
+	stopRequested := !e.StopRequestedAt.IsZero()
+	err = b.writeExitLocked(e, PhaseFailed, 1, message)
+	b.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	b.gate.RunnerExited(false, stopRequested)
+	return nil
+}
+
 // readGuestExit asks the guest for its exit record and records what it says.
 // finished is true once the runner's end is in the ledger.
 func (b *VMPalBackend) readGuestExit(ctx context.Context, name string, limit time.Duration) (finished bool, err error) {
@@ -152,7 +183,7 @@ func (b *VMPalBackend) readGuestExit(ctx context.Context, name string, limit tim
 		return false, nil
 	}
 	if parseErr != nil {
-		if err := b.recordExit(name, PhaseFailed, 1, vmpalMsgUnreadable); err != nil {
+		if err := b.recordUnreadableExit(name, vmpalMsgUnreadable); err != nil {
 			return false, err
 		}
 		return true, nil

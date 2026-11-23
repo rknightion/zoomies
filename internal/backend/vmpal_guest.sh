@@ -60,15 +60,16 @@ cmd_session() {
 }
 
 # Every target is tried, because a must-block target that answers is the one
-# result that matters most. Perl is used for the non-blocking connect that sh
-# cannot do, with a limit of its own on each attempt.
+# result that matters most. Perl is used for the time-limited connect that sh
+# cannot do. $! is cleared first so a stale error can never read as a timeout,
+# which is the one answer that passes a must-block target.
 cmd_egress() {
 	[ -n "${ZOOMIES_EGRESS_TARGETS:-}" ] || die "no egress targets were given"
 	# shellcheck disable=SC2016 # the program is Perl, and its variables are Perl's
 	"$PERL" -e '
 use strict; use warnings;
-use IO::Socket::IP; use Socket qw(SOCK_STREAM SOL_SOCKET SO_ERROR);
-use Errno qw(EINPROGRESS EWOULDBLOCK EALREADY ECONNREFUSED ETIMEDOUT ENETUNREACH EHOSTUNREACH);
+use IO::Socket::IP; use Socket qw(SOCK_STREAM);
+use Errno qw(ECONNREFUSED ETIMEDOUT ENETUNREACH EHOSTUNREACH);
 sub word { my $e = shift;
   return "refused" if $e == ECONNREFUSED;
   return "timeout" if $e == ETIMEDOUT;
@@ -76,21 +77,10 @@ sub word { my $e = shift;
   return "error"; }
 sub try { my ($target) = @_;
   my ($host, $port) = $target =~ /^\[?([^\[\]\s]+?)\]?:([0-9]{1,5})$/ or return "error";
-  my $s = IO::Socket::IP->new(PeerHost => $host, PeerPort => $port, Type => SOCK_STREAM, Blocking => 0);
-  return word($! + 0) unless $s;
-  my $deadline = time + 5;
-  while (!$s->connect) {
-    my $e = $! + 0;
-    return word($e) unless $e == EINPROGRESS || $e == EWOULDBLOCK || $e == EALREADY;
-    my $left = $deadline - time;
-    return "timeout" if $left <= 0;
-    my $w = ""; vec($w, fileno($s), 1) = 1;
-    my $x = $w;
-    return "timeout" unless select(undef, $w, $x, $left);
-    my $so = $s->getsockopt(SOL_SOCKET, SO_ERROR);
-    return word($so) if $so;
-  }
-  return "connected"; }
+  $! = 0;
+  my $s = IO::Socket::IP->new(PeerHost => $host, PeerPort => $port, Type => SOCK_STREAM, Timeout => 5);
+  return "connected" if $s;
+  return word($! + 0); }
 $| = 1; my $i = 0;
 for my $t (split " ", $ENV{ZOOMIES_EGRESS_TARGETS}) {
   print "zoomies-egress v1 target $i ", try($t), "\n"; $i++; }

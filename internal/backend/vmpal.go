@@ -67,8 +67,11 @@ const (
 
 // vmpalGate decides whether a clone may be made and whether a booted clone may receive a credential.
 type vmpalGate interface {
-	// Admit runs under the backend's lock before the ledger entry is written.
-	Admit(ctx context.Context, vms []vmpalVM, inFlight int) error
+	// Held says why this host is refusing new clones for now, or nil. It runs
+	// no command, so a host on hold refuses at once.
+	Held() error
+	// Admit runs under the admission lock, before the ledger entry is written.
+	Admit(ctx context.Context, slots vmpalSlotUse) error
 	// Verify runs after the network read-back and session check, before anything is delivered.
 	Verify(ctx context.Context, clone vmpalInfo) error
 	// RunnerExited records one finished runner for the breaker.
@@ -83,15 +86,23 @@ var errVMPalHeld = errors.New("backend: this Mac is not taking new VM runners fo
 // vmpalRefusingGate is the gate of a backend nobody gave one. It refuses both
 // questions, so that no configuration can reach a credential delivery without
 // the check that is meant to come before it.
-type vmpalRefusingGate struct{}
-
-func (vmpalRefusingGate) refusal() error {
-	return fmt.Errorf("%w: this agent has no check that the Mac's network policy is in force, so it makes no clone and delivers no credential", errVMPalHeld)
+type vmpalRefusingGate struct {
+	// reason says what is missing from the policy, when that is known.
+	reason string
 }
 
-func (g vmpalRefusingGate) Admit(context.Context, []vmpalVM, int) error { return g.refusal() }
-func (g vmpalRefusingGate) Verify(context.Context, vmpalInfo) error     { return g.refusal() }
-func (vmpalRefusingGate) RunnerExited(bool, bool)                       {}
+func (g vmpalRefusingGate) refusal() error {
+	reason := g.reason
+	if reason == "" {
+		reason = "this agent has no check that the Mac's network policy is in force"
+	}
+	return fmt.Errorf("%w: %s, so it makes no clone and delivers no credential", errVMPalHeld, reason)
+}
+
+func (g vmpalRefusingGate) Held() error                               { return g.refusal() }
+func (g vmpalRefusingGate) Admit(context.Context, vmpalSlotUse) error { return g.refusal() }
+func (g vmpalRefusingGate) Verify(context.Context, vmpalInfo) error   { return g.refusal() }
+func (vmpalRefusingGate) RunnerExited(bool, bool)                     {}
 
 // VMPalOptions configures the macOS VM backend.
 type VMPalOptions struct {
@@ -105,6 +116,9 @@ type VMPalOptions struct {
 	Template string
 	// MaxVMs is how many clones this agent may hold at once.
 	MaxVMs int
+	// CPUs and MemoryGB size each clone. Zero inherits the template's value.
+	CPUs     int
+	MemoryGB int
 	// GuestCIDR is the IPv4 network a clone must come up on.
 	GuestCIDR string
 	// EgressMustAllow and EgressMustBlock are the host:port targets of the
@@ -113,6 +127,9 @@ type VMPalOptions struct {
 	EgressMustBlock []string
 	// PolicyCheck is the command that attests the host's firewall policy.
 	PolicyCheck string
+	// EgressDial is how the Mac itself connects to a must-block target. Nil
+	// means a real TCP connection.
+	EgressDial func(ctx context.Context, address string) error
 	// WorkDir is the agent's work directory; state lives under vmpal/ in it.
 	WorkDir string
 	// RunnerVersion is the actions/runner release used when a pool pins none.
@@ -122,7 +139,8 @@ type VMPalOptions struct {
 	RunnerSHA256 string
 	// DownloadBaseURL overrides where the guest fetches the runner from.
 	DownloadBaseURL string
-	// Gate decides admission and delivery. Nil refuses both.
+	// Gate decides admission and delivery. Nil builds the real one from the
+	// policy above, and refuses both if that policy is incomplete.
 	Gate   vmpalGate
 	Logger *slog.Logger
 }
@@ -133,6 +151,8 @@ type VMPalBackend struct {
 	goos        string
 	template    string
 	maxVMs      int
+	cpus        int
+	memoryGB    int
 	guestNet    *net.IPNet
 	mustAllow   []string
 	mustBlock   []string
@@ -195,6 +215,9 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 	if err != nil || guestNet.IP.To4() == nil {
 		return nil, fmt.Errorf("%w: agent.vmpal.guest_cidr must be an IPv4 network such as 192.0.2.0/24", ErrBackendConfig)
 	}
+	if opts.CPUs < 0 || opts.MemoryGB < 0 {
+		return nil, fmt.Errorf("%w: a macOS VM's CPU count and memory must be positive, or zero to inherit them from the template", ErrBackendConfig)
+	}
 	binary := opts.Binary
 	if binary == "" {
 		binary = vmpalDefaultBinary
@@ -225,10 +248,6 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	gate := opts.Gate
-	if gate == nil {
-		gate = vmpalRefusingGate{}
-	}
 	version := strings.TrimPrefix(strings.TrimSpace(opts.RunnerVersion), "v")
 	if version == "" {
 		version = DefaultRunnerVersion
@@ -242,11 +261,13 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 		maxVMs = 1
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &VMPalBackend{
+	b := &VMPalBackend{
 		cli:         newVMPalCLI(binary),
 		goos:        goos,
 		template:    opts.Template,
 		maxVMs:      maxVMs,
+		cpus:        opts.CPUs,
+		memoryGB:    opts.MemoryGB,
 		guestNet:    guestNet,
 		mustAllow:   slices.Clone(opts.EgressMustAllow),
 		mustBlock:   slices.Clone(opts.EgressMustBlock),
@@ -255,7 +276,7 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 		version:     version,
 		sha256:      strings.ToLower(strings.TrimSpace(opts.RunnerSHA256)),
 		baseURL:     base,
-		gate:        gate,
+		gate:        opts.Gate,
 		now:         now,
 		log:         logger.With("backend", "vmpal"),
 		ledger:      &vmpalLedger{dir: clones},
@@ -270,7 +291,11 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 		removeEvery: vmpalRemoveEvery,
 		logPoll:     vmpalLogPoll,
 		addressWait: vmpalAddressWait,
-	}, nil
+	}
+	if b.gate == nil {
+		b.gate = b.policyGate(opts, filepath.Join(root, "state.json"))
+	}
+	return b, nil
 }
 
 // NewVMPalRegistry is a registry holding only the VM backend. Docker, Podman
@@ -432,7 +457,10 @@ func (b *VMPalBackend) Probe(ctx context.Context) Info {
 	if b.goos != "darwin" {
 		return refuse("the macOS VM backend only runs on a Mac; this host runs " + b.goos)
 	}
-	if _, refusing := b.gate.(vmpalRefusingGate); refusing || b.policyCheck == "" {
+	if err := b.gate.Held(); err != nil {
+		return refuse(strings.TrimPrefix(err.Error(), "backend: "))
+	}
+	if b.policyCheck == "" {
 		return refuse("no network policy check is configured, so this host will not start VM runners; set agent.vmpal.policy_check")
 	}
 	ctx, cancel := context.WithTimeout(ctx, vmpalProbeLimit)
@@ -441,14 +469,10 @@ func (b *VMPalBackend) Probe(ctx context.Context) Info {
 	if err != nil {
 		return refuse(fmt.Sprintf("could not list VMs: %v", err))
 	}
-	foreign := 0
-	for _, vm := range vms {
-		if _, ours := b.ownedRunner(vm.Name); !ours && vm.Guest == "macOS" && vm.State == "running" {
-			foreign++
-		}
-	}
-	if foreign >= vmpalMacOSLimit {
-		return refuse(fmt.Sprintf("%d macOS VMs Zoomies does not manage are running, which is all Apple allows on one Mac; shut one down to free a slot", foreign))
+	// Only other people's VMs can make this host unavailable. Its own clones
+	// filling every slot is a busy host doing its job.
+	if foreign := countVMPalSlots(vms, nil, b.ownedRunner).Foreign; len(foreign) >= vmpalSlotLimit(b.maxVMs) {
+		return refuse(fmt.Sprintf("macOS VMs Zoomies does not manage hold all %d of this host's VM slots (%s); shut one down to free a slot", vmpalSlotLimit(b.maxVMs), strings.Join(foreign, ", ")))
 	}
 	template, err := b.cli.Info(ctx, b.template)
 	if err != nil {
@@ -519,6 +543,10 @@ func (b *VMPalBackend) CreateWithResult(ctx context.Context, spec Spec) (CreateR
 	}
 	defer b.endCreate(name)
 	if err := b.provision(ctx, name, spec, source, payload); err != nil {
+		var failed *vmpalEgressFailure
+		if errors.As(err, &failed) && failed.Breach {
+			b.purgeClones(ctx)
+		}
 		b.discard(ctx, name)
 		return CreateResult{}, err
 	}
@@ -585,6 +613,11 @@ func (b *VMPalBackend) runnerSource(requested string) (vmpalRunnerSource, error)
 // admit decides under one lock whether this clone may exist and writes its
 // ledger entry, so the slot is taken before the next create can count them.
 func (b *VMPalBackend) admit(ctx context.Context, name string, spec Spec) error {
+	// Before the lock and the list: a host on hold refuses at once, however
+	// slow vmpal is being, and that may be why it is on hold.
+	if err := b.gate.Held(); err != nil {
+		return err
+	}
 	b.admitMu.Lock()
 	defer b.admitMu.Unlock()
 
@@ -597,17 +630,19 @@ func (b *VMPalBackend) admit(ctx context.Context, name string, spec Spec) error 
 			return fmt.Errorf("%w: VM %s already exists; a second create must not deliver a registration again", ErrContainerConflict, name)
 		}
 	}
+	// Every admitted create has an entry by now, because this lock is held
+	// from the count to the write. So the ledger alone is what is in flight,
+	// what is running and what is still being deleted.
 	b.mu.Lock()
-	_, known, err := b.ledger.read(name)
-	inFlight := len(b.creating)
+	entries, err := b.ledger.all()
 	b.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if known {
+	if _, known := entries[name]; known {
 		return fmt.Errorf("%w: runner %s already has a ledger entry; a second create must not deliver a registration again", ErrContainerConflict, spec.RunnerID)
 	}
-	if err := b.gate.Admit(ctx, vms, inFlight); err != nil {
+	if err := b.gate.Admit(ctx, countVMPalSlots(vms, entries, b.ownedRunner)); err != nil {
 		return err
 	}
 
@@ -839,6 +874,7 @@ func (b *VMPalBackend) harden(ctx context.Context, name string, cloned vmpalInfo
 	if err != nil {
 		return err
 	}
+	flags = append(flags, b.sizeFlags()...)
 	// A template that is already hardened answers "Nothing changed." and exits
 	// zero, so the read-back below is what proves anything.
 	if err := b.cli.Set(ctx, name, flags...); err != nil {
@@ -848,7 +884,8 @@ func (b *VMPalBackend) harden(ctx context.Context, name string, cloned vmpalInfo
 	if err != nil {
 		return err
 	}
-	if problems := vmpalSettingProblems(info.Settings, false); len(problems) > 0 {
+	problems := append(vmpalSettingProblems(info.Settings, false), b.sizeSettingProblems(info.Settings)...)
+	if len(problems) > 0 {
 		return fmt.Errorf("%w: clone %s did not take the required settings (%s); check the template and this version of VMPal", ErrBackendConfig, name, strings.Join(problems, "; "))
 	}
 	return nil
@@ -877,7 +914,7 @@ func (b *VMPalBackend) verify(ctx context.Context, name string) error {
 		}
 	}
 	if problems := b.sessionProblems(info); len(problems) > 0 {
-		return fmt.Errorf("%w: clone %s is not on the required network (%s); check the template's network settings", ErrBackendConfig, name, strings.Join(problems, "; "))
+		return fmt.Errorf("%w: clone %s did not boot as required (%s); check the template's network settings and the configured CPU and memory", ErrBackendConfig, name, strings.Join(problems, "; "))
 	}
 	if err := b.installHelper(ctx, name); err != nil {
 		return err
@@ -908,6 +945,7 @@ func (b *VMPalBackend) sessionProblems(info vmpalInfo) []string {
 		if hw.BridgedInterface != nil {
 			problems = append(problems, "the session is bridged")
 		}
+		problems = append(problems, b.sessionSizeProblems(hw)...)
 	}
 	if len(info.PendingSettings) != 0 {
 		problems = append(problems, "the VM has settings waiting for its next start")
@@ -916,6 +954,52 @@ func (b *VMPalBackend) sessionProblems(info vmpalInfo) []string {
 	if ip == nil || ip.To4() == nil || !b.guestNet.Contains(ip) {
 		problems = append(problems, fmt.Sprintf("its address is not inside %s", b.guestNet))
 	}
+	return problems
+}
+
+// sizeFlags sets the clone's size when one is configured. Without them a clone
+// keeps the template's, which is not always the size jobs are meant to get.
+func (b *VMPalBackend) sizeFlags() []string {
+	var flags []string
+	if b.cpus > 0 {
+		flags = append(flags, "--cpus", strconv.Itoa(b.cpus))
+	}
+	if b.memoryGB > 0 {
+		flags = append(flags, "--memory", strconv.Itoa(b.memoryGB)+"G")
+	}
+	return flags
+}
+
+// sizeSettingProblems holds the settings to the configured size. A value that is
+// missing or is not a number fails, because it does not show the size was taken.
+func (b *VMPalBackend) sizeSettingProblems(settings map[string]json.RawMessage) []string {
+	var problems []string
+	check := func(key string, want int) {
+		if want == 0 {
+			return
+		}
+		var got float64
+		raw, ok := settings[key]
+		if !ok || json.Unmarshal(raw, &got) != nil || got != float64(want) {
+			problems = append(problems, fmt.Sprintf("%s must be %d", key, want))
+		}
+	}
+	check("cpuCount", b.cpus)
+	check("memoryGB", b.memoryGB)
+	return problems
+}
+
+// sessionSizeProblems holds this boot to the configured size. Settings describe
+// the next start, so only the session says what the guest was really given.
+func (b *VMPalBackend) sessionSizeProblems(hw *vmpalSessionHardware) []string {
+	var problems []string
+	check := func(key string, got *float64, want int) {
+		if want != 0 && (got == nil || *got != float64(want)) {
+			problems = append(problems, fmt.Sprintf("the session's %s must be %d", key, want))
+		}
+	}
+	check("cpuCount", hw.CPUCount, b.cpus)
+	check("memoryGB", hw.MemoryGB, b.memoryGB)
 	return problems
 }
 

@@ -115,8 +115,11 @@ type state struct {
 	Trash             []string
 	Faults            map[string]*faultState
 	Rules             []execRule
+	Egress            map[string]string
 	ToolsNeverConnect bool
 	BridgeAtBoot      bool
+	BootCPUs          int
+	BootMemoryGB      int
 	NoStick           []string
 	UnknownSettings   []string
 	// DeleteLinger is how many further list calls a deleted VM stays in. The
@@ -332,6 +335,13 @@ func (f *Fake) BridgeAtBoot(on bool) {
 	f.edit(func(s *state) { s.BridgeAtBoot = on })
 }
 
+// BootWithSize makes a session come up with this hardware whatever the settings
+// say. Zero leaves that value following the settings.
+func (f *Fake) BootWithSize(cpus, memoryGB int) {
+	f.t.Helper()
+	f.edit(func(s *state) { s.BootCPUs, s.BootMemoryGB = cpus, memoryGB })
+}
+
 // DeleteLingers keeps a permanently deleted VM in list for n more calls.
 func (f *Fake) DeleteLingers(n int) {
 	f.edit(func(s *state) { s.DeleteLinger = n })
@@ -362,6 +372,20 @@ func (f *Fake) OnExec(match string, r ExecReply) {
 			}
 		}
 		s.Rules = append(s.Rules, execRule{Match: match, Reply: r})
+	})
+}
+
+// OnEgress answers the helper's egress subcommand target by target, in its
+// grammar, from the targets the backend actually passed. A target with no
+// answer here reports error. An OnExec rule matching the same command wins, which
+// is how a test scripts output that is not in the grammar.
+func (f *Fake) OnEgress(answers map[string]string) {
+	f.t.Helper()
+	f.edit(func(s *state) {
+		s.Egress = make(map[string]string, len(answers))
+		for target, answer := range answers {
+			s.Egress[target] = answer
+		}
 	})
 }
 
@@ -761,9 +785,13 @@ var stringSettings = map[string]string{"--network-mode": "networkMode", "--local
 
 var listSettings = map[string]string{"--unshare": "sharedFolders", "--unforward": "forwardedPorts", "--vsock-unforward": "vsockForwards"}
 
+// sizeSettings take a whole number; memory also needs the unit the real command
+// asks for, so a backend that forgets it fails here.
+var sizeSettings = map[string]string{"--cpus": "cpuCount", "--memory": "memoryGB"}
+
 func cmdSet(st *state, args []string) result {
 	var valued []string
-	for _, m := range []map[string]string{boolSettings, stringSettings, listSettings} {
+	for _, m := range []map[string]string{boolSettings, stringSettings, listSettings, sizeSettings} {
 		for f := range m {
 			valued = append(valued, f)
 		}
@@ -810,6 +838,22 @@ func cmdSet(st *state, args []string) result {
 				return usage("set: %s needs a value", flag)
 			}
 			change(key, v)
+		}
+	}
+	for flag, key := range sizeSettings {
+		for _, v := range p.vals[flag] {
+			digits := v
+			if flag == "--memory" {
+				var ok bool
+				if digits, ok = strings.CutSuffix(v, "G"); !ok {
+					return usage("set: --memory wants a size such as 10G, not %q", v)
+				}
+			}
+			n, err := strconv.Atoi(digits)
+			if err != nil || n <= 0 {
+				return usage("set: %s wants a positive whole number, not %q", flag, v)
+			}
+			change(key, n)
 		}
 	}
 	for flag, key := range listSettings {
@@ -895,6 +939,12 @@ func cmdStart(st *state, args []string) result {
 		CPUCount:         num(vm.Settings["cpuCount"]),
 		MemoryGB:         num(vm.Settings["memoryGB"]),
 	}
+	if st.BootCPUs > 0 {
+		hw.CPUCount = st.BootCPUs
+	}
+	if st.BootMemoryGB > 0 {
+		hw.MemoryGB = st.BootMemoryGB
+	}
 	if mode == "bridged" {
 		en0 := "en0"
 		hw.BridgedInterface = &en0
@@ -946,7 +996,24 @@ func cmdExec(st *state, dir string, args []string) result {
 			return result{out: r.Reply.Stdout, err: r.Reply.Stderr, code: r.Reply.ExitCode, hang: r.Reply.Hang}
 		}
 	}
+	if st.Egress != nil && strings.Contains(joined, "helper.sh egress") {
+		return result{out: egressAnswer(st.Egress, env["ZOOMIES_EGRESS_TARGETS"])}
+	}
 	return result{}
+}
+
+func egressAnswer(answers map[string]string, targets string) string {
+	var out strings.Builder
+	fields := strings.Fields(targets)
+	for i, target := range fields {
+		answer, ok := answers[target]
+		if !ok {
+			answer = "error"
+		}
+		fmt.Fprintf(&out, "zoomies-egress v1 target %d %s\n", i, answer)
+	}
+	fmt.Fprintf(&out, "zoomies-egress v1 end %d\n", len(fields))
+	return out.String()
 }
 
 func cmdStop(st *state, args []string) result {

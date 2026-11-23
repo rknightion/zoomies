@@ -92,6 +92,11 @@ type vmpalSessionHardware struct {
 	NetworkMode      string  `json:"networkMode"`
 	LocalNetworkCard bool    `json:"localNetworkCard"`
 	BridgedInterface *string `json:"bridgedInterface"`
+	// Pointers, so a release that stops reporting the size reads as unknown
+	// rather than as zero. Floats, so a fractional size fails the comparison
+	// rather than failing to decode the whole answer.
+	CPUCount *float64 `json:"cpuCount"`
+	MemoryGB *float64 `json:"memoryGB"`
 }
 
 type vmpalTools struct {

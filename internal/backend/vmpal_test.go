@@ -49,7 +49,9 @@ type vmpalTestGate struct {
 	exits     [][2]bool
 }
 
-func (g *vmpalTestGate) Admit(context.Context, []vmpalVM, int) error {
+func (g *vmpalTestGate) Held() error { return nil }
+
+func (g *vmpalTestGate) Admit(context.Context, vmpalSlotUse) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.admitErr
@@ -326,7 +328,7 @@ func TestNoCredentialIsDeliveredWhenTheGateRefusesAClone(t *testing.T) {
 	r.assertNoCloneLeft()
 }
 
-// Until the real check exists, nothing configured by accident may reach a
+// Without a complete policy, nothing configured by accident may reach a
 // credential delivery, and the refusal must not read as a broken container
 // runtime or as a host worth retrying at once.
 func TestABackendGivenNoGateMakesNoClone(t *testing.T) {
@@ -550,8 +552,8 @@ func TestTheExitRecordMapsToWhatTheAgentIsTold(t *testing.T) {
 		{"no job, stopped by the agent", "zoomies-exit v1 code=130 job=0\n", true, PhaseExited, 0, "", true, false},
 		{"no job, outdated runner", "zoomies-exit v1 code=7 job=0\n", false, PhaseFailed, 7, "the runner version is outdated", true, false},
 		{"no job, any other code", "zoomies-exit v1 code=3 job=0\n", false, PhaseFailed, 1, "the runner exited without taking a job", true, false},
-		{"a malformed record", "zoomies-exit v1 code=999 job=1\n", false, PhaseFailed, 1, vmpalMsgUnreadable, false, false},
-		{"a record with a second line", "zoomies-exit v1 code=0 job=1\nmore\n", false, PhaseFailed, 1, vmpalMsgUnreadable, false, false},
+		{"a malformed record", "zoomies-exit v1 code=999 job=1\n", false, PhaseFailed, 1, vmpalMsgUnreadable, true, false},
+		{"a record with a second line", "zoomies-exit v1 code=0 job=1\nmore\n", false, PhaseFailed, 1, vmpalMsgUnreadable, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newVMPalRig(t)
@@ -1357,6 +1359,102 @@ func TestProbeStaysAvailableWhileTheHostRunsItsOwnClones(t *testing.T) {
 	}
 }
 
+// The template's size is not always the size jobs need, so a configured one is
+// applied to the stopped clone and the template itself is left as it was.
+func TestAConfiguredSizeIsAppliedToTheCloneAndHeldThroughBoot(t *testing.T) {
+	r := newVMPalRig(t)
+	r.opts.CPUs, r.opts.MemoryGB = 6, 10
+	r.restart()
+	vm, ok := r.fake.VM(r.create())
+	if !ok {
+		t.Fatal("the clone does not exist")
+	}
+	if vm.Settings["cpuCount"] != float64(6) || vm.Settings["memoryGB"] != float64(10) {
+		t.Errorf("settings are %v CPUs and %v GB", vm.Settings["cpuCount"], vm.Settings["memoryGB"])
+	}
+	if vm.SessionHardware == nil || vm.SessionHardware.CPUCount != 6 || vm.SessionHardware.MemoryGB != 10 {
+		t.Errorf("the session has %+v", vm.SessionHardware)
+	}
+	template, _ := r.fake.VM(vmpalTestTemplate)
+	if template.Settings["cpuCount"] != float64(4) || template.Settings["memoryGB"] != float64(8) {
+		t.Errorf("the template was resized: %v CPUs, %v GB", template.Settings["cpuCount"], template.Settings["memoryGB"])
+	}
+}
+
+func TestACloneWithNoConfiguredSizeInheritsTheTemplates(t *testing.T) {
+	r := newVMPalRig(t)
+	vm, ok := r.fake.VM(r.create())
+	if !ok {
+		t.Fatal("the clone does not exist")
+	}
+	if vm.SessionHardware == nil || vm.SessionHardware.CPUCount != 4 || vm.SessionHardware.MemoryGB != 8 {
+		t.Errorf("the session has %+v", vm.SessionHardware)
+	}
+}
+
+// A job on a smaller VM than configured fails in ways that look like the job's
+// fault, so a size that did not take is a failed clone like any other setting.
+func TestACloneThatDoesNotGetItsSizeIsDeleted(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		arrange func(*vmpalRig)
+		// booted is false when the read-back on the stopped clone must catch it.
+		booted bool
+	}{
+		{"the CPU count does not stick", func(r *vmpalRig) { r.fake.SettingsDoNotStick("cpuCount") }, false},
+		{"the memory does not stick", func(r *vmpalRig) { r.fake.SettingsDoNotStick("memoryGB") }, false},
+		{"it boots with other CPUs", func(r *vmpalRig) { r.fake.BootWithSize(2, 0) }, true},
+		{"it boots with other memory", func(r *vmpalRig) { r.fake.BootWithSize(0, 8) }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newVMPalRig(t)
+			r.opts.CPUs, r.opts.MemoryGB = 6, 10
+			r.restart()
+			tc.arrange(r)
+			if !tc.booted {
+				// A start would now report a backend fault, so the config fault
+				// below can only come from the read-back on the stopped clone.
+				r.fake.Fail("start", fakevmpal.Fault{Stderr: "this clone should not have been started"})
+			}
+			_, err := r.b.Create(context.Background(), vmpalTestSpec(vmpalTestRunner))
+			if got := Fault(err); got != store.FaultConfig {
+				t.Fatalf("fault %q: %v", got, err)
+			}
+			if r.credentialReachedGuest() {
+				t.Error("the credential reached the guest")
+			}
+			r.assertNoCloneLeft()
+		})
+	}
+}
+
+// A release that stops reporting a size has not shown the clone has it.
+func TestASizeThatIsNotReportedFailsTheCheck(t *testing.T) {
+	r := newVMPalRig(t)
+	r.opts.CPUs, r.opts.MemoryGB = 6, 10
+	r.restart()
+	if got := r.b.sizeSettingProblems(map[string]json.RawMessage{"cpuCount": json.RawMessage(`"6"`)}); len(got) != 2 {
+		t.Errorf("settings problems: %v", got)
+	}
+	if got := r.b.sessionSizeProblems(&vmpalSessionHardware{}); len(got) != 2 {
+		t.Errorf("session problems: %v", got)
+	}
+}
+
+func TestANegativeSizeIsRefused(t *testing.T) {
+	r := newVMPalRig(t)
+	for _, change := range []func(*VMPalOptions){
+		func(o *VMPalOptions) { o.CPUs = -1 },
+		func(o *VMPalOptions) { o.MemoryGB = -1 },
+	} {
+		opts := r.opts
+		change(&opts)
+		if _, err := NewVMPal(opts); !errors.Is(err, ErrBackendConfig) {
+			t.Errorf("NewVMPal returned %v", err)
+		}
+	}
+}
+
 func TestCheckVMPalTemplate(t *testing.T) {
 	good := vmpalInfo{vmpalVM: vmpalVM{Name: "t", Guest: "macOS", Installed: true, State: "stopped", AgentControl: true}, Tools: vmpalTools{Version: "0.34"}}
 	if err := checkVMPalTemplate(good); err != nil {
@@ -1793,8 +1891,8 @@ func TestTheHelperFitsTheInstallCommand(t *testing.T) {
 	}
 }
 
-// The egress grammar is parsed in the next slice, and the script has to speak
-// it now. Loopback only: one port with a listener and one without.
+// The host's parser accepts only this grammar, so the script has to speak it
+// exactly. Loopback only: one port with a listener and one without.
 func TestTheHelperReportsEgressInItsGrammar(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/perl"); err != nil {
 		t.Skip("no /usr/bin/perl")
