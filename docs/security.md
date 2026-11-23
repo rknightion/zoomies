@@ -246,6 +246,34 @@ systemd host, it writes
 those controllers to that user's slice and restarts that user's daemon. It
 says so when it does, and a daemon that already applies limits is left alone.
 
+### A Mac running jobs in throwaway VMs
+
+On a Mac enrolled for [VM isolation](vmpal.md), the agent clones a template VM
+for each job and deletes the clone afterwards, so a job has root in its own
+guest and not on the Mac. What that buys depends on the host firewall, which
+Zoomies checks and never edits:
+
+* **No registration reaches a clone until the clone passes an egress check**: its
+  must-allow targets connect, its must-block targets time out after the Mac
+  itself has shown it can reach them, and an operator-supplied policy check
+  attests that the firewall is in force for IPv4 and IPv6 on every candidate
+  bridge. A breach deletes every clone on the host and holds new work.
+* **IPv6, candidate bridges and spoofed source addresses are the operator's to
+  cover.** IPv6 is never judged from inside the guest, a clone's bridge exists
+  only while it runs, and a job with root can change its guest's address, so
+  the rules must be keyed to the bridge and drop other sources.
+* **The check is a point in time.** A firewall flushed after a clone passes is
+  not noticed until the next clone. The public internet stays open to jobs.
+* **No GitHub App key or controller credential enters a guest.** The single-use
+  registration is passed through the guest's environment, written to a file
+  readable only by its owner, and deleted when the runner reads it.
+* **The agent runs only the VM backend.** On macOS a remote agent refuses to
+  start unless `agent.process_isolation` is in its config file, so losing the
+  setting cannot fall back to running jobs on the Mac.
+
+Every clone inherits the template's account password, so do not reuse it. See
+[macOS runners in throwaway VMs](vmpal.md) for the full list of limits.
+
 ---
 
 ## 4. Authentication and authorisation

@@ -74,7 +74,7 @@ review.
 | `internal/controller` | Wiring: the reconcile loop, the machine loop, webhook ingest, the agent task queue, the log relay, and every payload the event stream carries (`views.go`, `derived.go`). The machine loop is **not** part of `Reconcile`: a clone takes minutes and `reconcileMu` is held for a whole scheduling pass. |
 | `internal/config` | `zoomies.yaml` + `ZOOMIES_*` overrides, and the validator. |
 | `internal/github` | App auth, JIT configs, webhook validation, the fallback poller, and `fake.go`, a fake GitHub used by tests. |
-| `internal/backend` | Docker, Podman, bare process. The Docker API is hand-rolled `net/http` against the Engine API on purpose (see below). |
+| `internal/backend` | Docker, Podman, bare process, and the macOS VM clone backend (`vmpal*.go`, registered alone on a Mac enrolled for VM isolation, kind `process`). The Docker API is hand-rolled `net/http` against the Engine API on purpose (see below). |
 | `internal/agent` | The runner-executing half and its outbound transport. |
 | `internal/mcp` | The MCP tools and both transports (stdio for `zoomies mcp`, Streamable HTTP for `/mcp`). A tool calls the REST API through the `mcp.API` interface and nothing else (no store, no controller), so it can never do what the caller's token could not. |
 
@@ -189,7 +189,7 @@ internal/scheduler  pure scaling decisions and label matching
 internal/updates    which release an update mode would take, and why; pure
 internal/updates/channel  the update folder: the service's side of the helper's files
 internal/github     App auth, JIT configs, webhooks, the fallback poller
-internal/backend    Docker, Podman and bare-process runner backends
+internal/backend    Docker, Podman, bare-process and macOS VM clone runner backends
 internal/auth       identity, RBAC, tokens, audit, OIDC
 internal/api        REST, SSE, metrics, and the embedded UI
 internal/provider   the infrastructure-provider contract, its fake, and Proxmox

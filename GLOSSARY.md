@@ -28,6 +28,14 @@ _Avoid_: "the agent on this host" as a stand-in for the host
 Work that ran on GitHub's own runners rather than on this fleet.
 _Avoid_: Hosted elsewhere, elsewhere, other runners
 
+**Template** and **Clone** (macOS VM isolation):
+The template is the prepared, shut-down macOS VM on a Mac host that every job is cloned from. A clone is the throwaway copy made for one job, deleted when the job ends. Neither is a Machine: no provider rented them, and the agent that runs them is on the Mac already.
+_Avoid_: Image (for a template), machine (for a clone)
+
+**Egress check**:
+The test run inside a fresh clone, before the job's registration is delivered, that the Mac's firewall limits what the clone can reach.
+_Avoid_: Network test, firewall check
+
 ### Stopping and holding
 
 **Drain**:

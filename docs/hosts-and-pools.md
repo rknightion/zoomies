@@ -274,6 +274,19 @@ When a host goes away, the controller fails its runners after five minutes and
 removes their GitHub registrations. A registration GitHub still reports as busy
 is not forced: its removal is deferred until GitHub reports it idle or absent.
 
+### A Mac in throwaway VMs
+
+A Mac can be a host that runs every job in a new, disposable macOS virtual
+machine instead of on the Mac. To the controller it is an ordinary host offering
+the `process` backend, so a pool for it uses `backend: process`, `platform:
+macos/arm64` and a `host_selector` of `isolation=vmpal`, and the host's
+backend shows as **process** with a detail line that says macOS VM clones.
+Capacity is fixed at `agent.vmpal.max_vms` (Apple allows two macOS VMs at once),
+and per-runner CPU and memory are not reported. Enrol it as the logged-in user,
+cordon it before a pool can reach it, and update its agent by hand, never with
+`zoomies upgrade`. [macOS runners in throwaway VMs](vmpal.md) has the whole
+procedure and what the Mac's firewall must guarantee.
+
 ### What a host brings with it
 
 | What | Where it comes from | Why it matters |

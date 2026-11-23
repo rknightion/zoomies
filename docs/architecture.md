@@ -705,14 +705,15 @@ for the threat model and each individual toggle.
   you did not ask it to rent. An external autoscaler driven by the
   [capacity-demand receiver](capacity-demand-receiver.md) remains a first-class
   alternative for fleets that would rather own that half themselves.
-* Not VM-per-job isolation. A rented machine hosts the same agent and the same
-  runner backend as a machine you built yourself, so it runs several runners at
-  once and they are containers, not virtual machines. The `backend.Backend`
-  interface (create, inspect, log, remove) is the shape of a runner on a host
-  the agent already has, and a backend that put each job in its own VM could be
-  added behind it without the agent learning anything new. Renting the host is
-  the other contract, on the controller's side, and the two are deliberately
-  separate.
+* Not VM-per-job isolation on a rented machine. A rented machine hosts the same
+  agent and the same runner backends as a machine you built yourself, so it
+  runs several runners at once and they are containers, not virtual machines.
+  The one place a job gets its own VM is a Mac enrolled for
+  [VM isolation](vmpal.md): there the agent clones a prepared macOS VM for each
+  job behind the `backend.Backend` interface (create, inspect, log, remove),
+  under the `process` kind, and the controller learns nothing new. That is a
+  backend on a host the agent already has. Renting the host is the other
+  contract, on the controller's side, and the two are deliberately separate.
 * Not multi-tenant across unrelated organisations. One Zoomies is one team's
   fleet.
 
