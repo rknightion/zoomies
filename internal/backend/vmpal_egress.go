@@ -386,10 +386,13 @@ func (b *VMPalBackend) purgeClones(ctx context.Context) {
 // clone still being created has nobody to report to: its own create fails on
 // the next stage change and clears the entry.
 func (b *VMPalBackend) purgeClone(ctx context.Context, name string) {
-	b.stopWatcher(name)
+	// In memory and first, because every write below can fail on a full disk,
+	// and this is what stops a create in flight from delivering regardless.
 	b.mu.Lock()
+	b.abandonLocked(name)
 	creating := b.creating[name]
 	b.mu.Unlock()
+	b.stopWatcher(name)
 	if !creating {
 		if err := b.recordExit(name, PhaseFailed, 1, vmpalPurgeMessage); err != nil {
 			b.log.Warn("could not record why a clone is being deleted", "vm", name, "error", err)

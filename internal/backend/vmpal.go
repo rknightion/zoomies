@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -63,9 +64,14 @@ const (
 	// vmpalMacOSLimit is Apple's limit on macOS VMs running on one Mac, counting
 	// those of every other app.
 	vmpalMacOSLimit = 2
-	// vmpalFinalRead bounds the one look at a guest's exit record that a removal
-	// makes. The clone is being deleted either way, so it must not wait long.
+	// vmpalFinalRead bounds the whole of a removal's wait for a guest's exit
+	// record. GitHub can report a job finished just before the guest has written
+	// it, so a "running" answer is asked again, but the clone is being deleted
+	// either way and a guest must not be able to put that off.
 	vmpalFinalRead = 3 * time.Second
+	// vmpalFinalReadEvery is how often that look is repeated while the guest
+	// says its runner has not finished.
+	vmpalFinalReadEvery = 250 * time.Millisecond
 	// vmpalSpentKeep is how long a runner stays refused after its registration
 	// was sent, which is far longer than a redelivered create can arrive.
 	vmpalSpentKeep = 24 * time.Hour
@@ -207,7 +213,15 @@ type VMPalBackend struct {
 	// stopped before its result could be written is not taken for a guest that
 	// powered itself off.
 	forcedOff map[string]bool
-	closed    bool
+	// abandoned is the clones a breach purge has condemned. It is separate from
+	// removing because nobody asked for this end: a purged clone whose exit
+	// could not be written is a failure to report, not a removal in progress.
+	// It is memory for the same reason removing is, and because the disk being
+	// full is the case it exists for.
+	abandoned map[string]bool
+	// deliveries cancels the credential delivery a clone has in flight.
+	deliveries map[string]context.CancelFunc
+	closed     bool
 
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
@@ -221,6 +235,14 @@ type VMPalBackend struct {
 	logPoll     time.Duration
 	addressWait time.Duration
 	finalRead   time.Duration
+	// finalWait is how long a removal goes on asking a guest that answers
+	// "still running". The whole wait is held to the larger of this and
+	// finalRead, and in production the two are the same budget.
+	finalWait  time.Duration
+	finalEvery time.Duration
+	// afterDropRemoved runs in List just after dropRemoved, so a test can finish
+	// a removal at that exact point. Nil outside tests.
+	afterDropRemoved func()
 }
 
 var (
@@ -320,6 +342,8 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 		slots:       make(map[string]*vmpalSlots),
 		removing:    make(map[string]bool),
 		forcedOff:   make(map[string]bool),
+		abandoned:   make(map[string]bool),
+		deliveries:  make(map[string]context.CancelFunc),
 		baseCtx:     ctx,
 		baseCancel:  cancel,
 		watchEvery:  vmpalWatchEvery,
@@ -329,6 +353,8 @@ func NewVMPal(opts VMPalOptions) (*VMPalBackend, error) {
 		logPoll:     vmpalLogPoll,
 		addressWait: vmpalAddressWait,
 		finalRead:   vmpalFinalRead,
+		finalWait:   vmpalFinalRead,
+		finalEvery:  vmpalFinalReadEvery,
 	}
 	if b.gate == nil {
 		b.gate = b.policyGate(opts, filepath.Join(root, "state.json"))
@@ -395,9 +421,9 @@ func (b *VMPalBackend) advance(name string, stage vmpalStage, change func(*vmpal
 	if err != nil {
 		return err
 	}
-	// removing as well as the stage, because on a full disk the stage may never
-	// have been written.
-	if !ok || e.Stage == vmpalStageDeleting || b.removing[name] {
+	// removing and abandoned as well as the stage, because on a full disk the
+	// stage may never have been written.
+	if !ok || e.Stage == vmpalStageDeleting || b.removing[name] || b.abandoned[name] {
 		return fmt.Errorf("backend: clone %s is being deleted, so its create was abandoned", name)
 	}
 	if stage.rank() > e.Stage.rank() {
@@ -773,6 +799,36 @@ func (b *VMPalBackend) pruneSpent() {
 	}
 }
 
+// abandonLocked condemns a clone: no later stage, no watcher and no credential.
+// A delivery already under way is cancelled, because the check it passed
+// described a host that has since been shown not to hold. The caller holds mu.
+func (b *VMPalBackend) abandonLocked(name string) {
+	b.abandoned[name] = true
+	if cancel := b.deliveries[name]; cancel != nil {
+		cancel()
+	}
+}
+
+// claimDelivery is the last check before a credential moves, and it registers
+// how to cancel that delivery under the same lock an abandon takes. Either the
+// abandon comes first and this refuses, or this comes first and the abandon
+// cancels the command, which a context already cancelled never starts.
+func (b *VMPalBackend) claimDelivery(name string, cancel context.CancelFunc) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.abandoned[name] || b.removing[name] {
+		return fmt.Errorf("backend: clone %s is being deleted, so its registration was not sent", name)
+	}
+	b.deliveries[name] = cancel
+	return nil
+}
+
+func (b *VMPalBackend) endDelivery(name string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.deliveries, name)
+}
+
 func (b *VMPalBackend) endCreate(name string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -843,6 +899,10 @@ func (b *VMPalBackend) provision(ctx context.Context, name string, spec Spec, so
 	}
 	deliverCtx, cancelDeliver := context.WithTimeout(ctx, vmpalDeliverLimit)
 	defer cancelDeliver()
+	if err := b.claimDelivery(name, cancelDeliver); err != nil {
+		return err
+	}
+	defer b.endDelivery(name)
 	out, err = b.helper(deliverCtx, name, vmpalGuestStepLimit, map[string]string{
 		EnvUpstreamJITConfig: spec.Credentials.JITConfig,
 		vmpalEnvVar:          payload,
@@ -1183,7 +1243,7 @@ func (b *VMPalBackend) Status(ctx context.Context, h Handle) (Status, error) {
 	vm, present := findVMPalVM(vms, name)
 	b.mu.Lock()
 	e, ok, err := b.ledger.read(name)
-	creating, removing := b.creating[name], b.removing[name]
+	creating, removing, abandoned := b.creating[name], b.removing[name], b.abandoned[name]
 	b.mu.Unlock()
 	if err != nil {
 		return Status{}, err
@@ -1194,7 +1254,7 @@ func (b *VMPalBackend) Status(ctx context.Context, h Handle) (Status, error) {
 		}
 		e = b.unledgeredEntry(vm)
 	}
-	st := vmpalStatus(e, vm, present, creating, removing)
+	st := vmpalStatus(e, vm, present, creating, removing, abandoned)
 	b.noteGuestPowerOff(e, vm, st)
 	return st, nil
 }
@@ -1202,7 +1262,9 @@ func (b *VMPalBackend) Status(ctx context.Context, h Handle) (Status, error) {
 // noteGuestPowerOff feeds the breaker for a clone that went off with its runner
 // up and nobody having asked. Nothing in the guest can say how that runner
 // ended, and a template that dies after registering would otherwise register
-// without limit.
+// without limit. Only a clone this process is watching counts: a Mac restart or
+// logout stops the agent too, so a clone first seen stopped by a new process is
+// the host's doing and no evidence about the job or the template.
 func (b *VMPalBackend) noteGuestPowerOff(e vmpalEntry, vm vmpalVM, st Status) {
 	if e.Exit != nil || vm.State != "stopped" || st.Phase != PhaseFailed || st.Message != vmpalMsgVMStopped {
 		return
@@ -1212,7 +1274,8 @@ func (b *VMPalBackend) noteGuestPowerOff(e vmpalEntry, vm vmpalVM, st Status) {
 	b.mu.Lock()
 	e, ok, err := b.ledger.read(vm.Name)
 	if err != nil || !ok || e.Exit != nil || !e.StopRequestedAt.IsZero() || e.Stage == vmpalStageDeleting ||
-		e.Stage.preparing() || b.creating[vm.Name] || b.removing[vm.Name] || b.forcedOff[vm.Name] {
+		e.Stage.preparing() || b.creating[vm.Name] || b.removing[vm.Name] || b.forcedOff[vm.Name] ||
+		b.watchers[vm.Name] == nil {
 		b.mu.Unlock()
 		return
 	}
@@ -1286,17 +1349,14 @@ func (b *VMPalBackend) List(ctx context.Context) ([]Workload, error) {
 		return nil, err
 	}
 
-	b.dropRemoved(entries, vms)
-	b.mu.Lock()
-	removing := make(map[string]bool, len(b.removing))
-	for name := range b.removing {
-		removing[name] = true
+	removing, abandoned := b.dropRemoved(entries, vms)
+	if b.afterDropRemoved != nil {
+		b.afterDropRemoved()
 	}
-	b.mu.Unlock()
 
 	out := make([]Workload, 0, len(entries))
 	add := func(e vmpalEntry, vm vmpalVM, present, inFlight bool) {
-		st := vmpalStatus(e, vm, present, inFlight, removing[e.VMName])
+		st := vmpalStatus(e, vm, present, inFlight, removing[e.VMName], abandoned[e.VMName])
 		b.noteGuestPowerOff(e, vm, st)
 		out = append(out, Workload{
 			Handle: Handle(e.VMName), Name: firstNonEmpty(e.RunnerName, e.VMName),
@@ -1328,7 +1388,9 @@ func (b *VMPalBackend) List(ctx context.Context) ([]Workload, error) {
 // dropRemoved forgets records whose removal finished after the ledger was read.
 // Their VM has gone from the later list, and without this they would be reported
 // as a clone lost from under a job that this agent has just finished removing.
-func (b *VMPalBackend) dropRemoved(entries map[string]vmpalEntry, vms []vmpalVM) {
+// It returns what is being removed and abandoned from the same lock hold: a
+// removal finishing between the two looks would be in neither, and read as lost.
+func (b *VMPalBackend) dropRemoved(entries map[string]vmpalEntry, vms []vmpalVM) (removing, abandoned map[string]bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for name := range entries {
@@ -1339,6 +1401,7 @@ func (b *VMPalBackend) dropRemoved(entries map[string]vmpalEntry, vms []vmpalVM)
 			delete(entries, name)
 		}
 	}
+	return maps.Clone(b.removing), maps.Clone(b.abandoned)
 }
 
 // Stats returns nothing: the host cannot see inside a guest's use of its slot.
@@ -1567,33 +1630,45 @@ func (b *VMPalBackend) Remove(ctx context.Context, h Handle) error {
 	}
 	b.stopWatcher(name)
 	b.readFinalExit(ctx, name)
-	// Only now: until the record has been read, calling this runner finished
-	// could report a clean exit for a job that failed.
+	// Only now: from here a runner with no record reads as ended with its exit
+	// unknown, which must not win a race with the record being read.
 	b.mu.Lock()
 	b.removing[name] = true
 	b.mu.Unlock()
 	return b.removeClone(ctx, name)
 }
 
-// readFinalExit makes one bounded attempt to learn how a runner ended before
-// its clone goes. On the normal path the controller's remove gets here before
-// the watcher's next tick, and without this a real job would rarely clear the
-// breaker. readGuestExit stores the first account only, so a watcher read in
-// flight cannot make it count twice. No answer is not evidence that no job ran,
-// so a failed read counts for nothing and the delete goes ahead.
+// readFinalExit makes a bounded attempt to learn how a runner ended before its
+// clone goes. On the normal path the controller's remove gets here before the
+// watcher's next tick, and often before the guest has written its record, which
+// it does only once the runner has exited; without this a real job would rarely
+// clear the breaker. So "running" is asked again until the budget ends, while a
+// read that fails ends the wait at once, because that guest is not going to say.
+// readGuestExit stores the first account only, so a watcher read in flight
+// cannot make it count twice. No answer is not evidence that no job ran, so it
+// counts for nothing and the delete goes ahead. A retried removal has had its
+// wait, and a purged clone is not worth one.
 func (b *VMPalBackend) readFinalExit(ctx context.Context, name string) {
 	b.mu.Lock()
 	e, ok, err := b.ledger.read(name)
-	creating := b.creating[name]
+	skip := b.creating[name] || b.removing[name] || b.abandoned[name]
 	b.mu.Unlock()
-	if err != nil || !ok || creating || e.Exit != nil ||
+	if err != nil || !ok || skip || e.Exit != nil ||
 		(e.Stage != vmpalStageDelivering && e.Stage != vmpalStageRunning) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, b.finalRead)
+	ctx, cancel := context.WithTimeout(ctx, max(b.finalRead, b.finalWait))
 	defer cancel()
-	if _, err := b.readGuestExit(ctx, name, b.finalRead); err != nil {
-		b.log.Info("could not read a runner's exit record before deleting its clone", "vm", name, "error", err)
+	askUntil := time.Now().Add(b.finalWait)
+	for {
+		finished, err := b.readGuestExit(ctx, name, b.finalRead)
+		if err != nil {
+			b.log.Info("could not read a runner's exit record before deleting its clone", "vm", name, "error", err)
+			return
+		}
+		if finished || !time.Now().Before(askUntil) || !sleepVMPal(ctx, b.finalEvery) {
+			return
+		}
 	}
 }
 
@@ -1612,6 +1687,7 @@ func (b *VMPalBackend) removeClone(ctx context.Context, name string) error {
 		return err
 	}
 	delete(b.removing, name)
+	delete(b.abandoned, name)
 	delete(b.forcedOff, name)
 	return nil
 }

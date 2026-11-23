@@ -147,6 +147,10 @@ func (r *vmpalRig) open() {
 	b.removeEvery = 5 * time.Millisecond
 	b.logPoll = 5 * time.Millisecond
 	b.addressWait = 0
+	// One look at the exit record unless a test is about the waiting: most
+	// clones here answer "running" for ever.
+	b.finalWait = 0
+	b.finalEvery = 5 * time.Millisecond
 	b.cli.stopGrace = 200 * time.Millisecond
 	r.b = b
 	r.t.Cleanup(b.Close)

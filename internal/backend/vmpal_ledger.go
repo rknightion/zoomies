@@ -229,7 +229,7 @@ const (
 
 // vmpalStatus is the recovery table: what one ledger record and the VM it names
 // mean, reading nothing from the guest.
-func vmpalStatus(e vmpalEntry, vm vmpalVM, present, creating, removing bool) Status {
+func vmpalStatus(e vmpalEntry, vm vmpalVM, present, creating, removing, abandoned bool) Status {
 	st := Status{Handle: Handle(e.VMName), StartedAt: e.StartedAt}
 	if st.StartedAt.IsZero() {
 		st.StartedAt = e.CreatedAt
@@ -244,10 +244,16 @@ func vmpalStatus(e vmpalEntry, vm vmpalVM, present, creating, removing bool) Sta
 		st.Phase = PhaseStarting
 	case e.Exit != nil:
 		st.Phase, st.ExitCode, st.Message, st.ExitedAt = e.Exit.Phase, e.Exit.Code, e.Exit.Message, e.Exit.At
+	case abandoned:
+		// The purge could not write this down. Until the clone has gone it must
+		// not read as a live runner, or nothing would ask for the delete again.
+		return fail(vmpalPurgeMessage)
 	case removing:
 		// The agent asked for this delete, so its progress is not a runner
-		// failing, and reporting it as one could record a lost job.
-		st.Phase = PhaseExited
+		// failing, and reporting it as one could record a lost job. Nor is it a
+		// clean exit: this may be a busy runner being force-removed, and only
+		// GitHub knows how that job ended.
+		st.Phase = PhaseExitUnknown
 	case !present && stopped:
 		st.Phase = PhaseGone
 	case !present:

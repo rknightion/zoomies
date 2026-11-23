@@ -35,7 +35,7 @@ type vmpalWatcher struct{ cancel context.CancelFunc }
 func (b *VMPalBackend) ensureWatcher(name string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.closed || b.watchers[name] != nil {
+	if b.closed || b.watchers[name] != nil || b.abandoned[name] {
 		return
 	}
 	ctx, cancel := context.WithCancel(b.baseCtx)
@@ -153,8 +153,15 @@ func (b *VMPalBackend) finishEnding(name, message string, recordErr error) bool 
 
 // forceOff runs on a context of its own: the watcher's is cancelled when the
 // agent shuts down, and this clone is not one to leave running through that.
+// Once a stop has worked it is not issued again, and only the call that set the
+// flag clears it, so a failed retry cannot erase the record that Zoomies turned
+// this VM off and have the guest blamed for it.
 func (b *VMPalBackend) forceOff(name string) {
 	b.mu.Lock()
+	if b.forcedOff[name] {
+		b.mu.Unlock()
+		return
+	}
 	b.forcedOff[name] = true
 	b.mu.Unlock()
 	if err := b.cli.Stop(context.Background(), name, vmpalForceOffLimit); err != nil {

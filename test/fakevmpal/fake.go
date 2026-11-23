@@ -90,6 +90,11 @@ type ExecReply struct {
 	Stderr   string
 	ExitCode int
 	Hang     bool
+	// Then, when set, takes over after this reply has answered Times calls. A
+	// guest's answer changes while the host is asking, and a test of that
+	// ordering cannot script it up front any other way.
+	Times int
+	Then  *ExecReply
 }
 
 // ExecCall is one recorded exec.
@@ -991,10 +996,19 @@ func cmdExec(st *state, dir string, args []string) result {
 		return fail(70, "%v", err)
 	}
 	joined := strings.Join(p.rest, " ")
-	for _, r := range st.Rules {
-		if strings.Contains(joined, r.Match) {
-			return result{out: r.Reply.Stdout, err: r.Reply.Stderr, code: r.Reply.ExitCode, hang: r.Reply.Hang}
+	for i := range st.Rules {
+		if !strings.Contains(joined, st.Rules[i].Match) {
+			continue
 		}
+		reply := st.Rules[i].Reply
+		if reply.Then != nil {
+			if reply.Times > 0 {
+				st.Rules[i].Reply.Times--
+			} else {
+				reply = *reply.Then
+			}
+		}
+		return result{out: reply.Stdout, err: reply.Stderr, code: reply.ExitCode, hang: reply.Hang}
 	}
 	if st.Egress != nil && strings.Contains(joined, "helper.sh egress") {
 		return result{out: egressAnswer(st.Egress, env["ZOOMIES_EGRESS_TARGETS"])}

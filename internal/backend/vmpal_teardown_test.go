@@ -359,14 +359,16 @@ func TestAReconcileDuringARemovalSeesNoFailure(t *testing.T) {
 	if err := r.b.Remove(context.Background(), Handle(name)); !errors.Is(err, ErrRemovalInProgress) {
 		t.Fatalf("remove returned %v", err)
 	}
-	if st := r.workload(name).Status; st.Phase != PhaseExited || st.ExitCode != 0 {
+	// Unknown rather than exited: this may be a busy runner being force-removed,
+	// and "exited cleanly" would be a claim about a job nobody saw finish.
+	if st := r.workload(name).Status; st.Phase != PhaseExitUnknown || st.ExitCode != 0 {
 		t.Errorf("List reported %s/%d during the removal", st.Phase, st.ExitCode)
 	}
 	st, err := r.b.Status(context.Background(), Handle(name))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Phase != PhaseExited || st.ExitCode != 0 {
+	if st.Phase != PhaseExitUnknown || st.ExitCode != 0 {
 		t.Errorf("Status reported %s/%d during the removal", st.Phase, st.ExitCode)
 	}
 }
@@ -451,5 +453,220 @@ func TestAListWithNoVMsKeyIsAnError(t *testing.T) {
 				t.Fatalf("list returned %v", err)
 			}
 		})
+	}
+}
+
+// A breach proves the host's policy is not in force, so a clone still being
+// made must never get its credential, even when the disk is too full to record
+// that it is condemned and vmpal could not delete it either.
+func TestABreachPurgeOnAFullDiskStopsACreateInFlight(t *testing.T) {
+	r := newVMPalRig(t)
+	ctx := context.Background()
+	name := r.b.vmName(vmpalTestRunner)
+	r.gate.onVerify = func() {
+		r.diskFull(true)
+		r.fake.Fail("delete", fakevmpal.Fault{Times: 1})
+		r.b.purgeClone(ctx, name)
+		r.diskFull(false)
+	}
+	if _, err := r.b.Create(ctx, vmpalTestSpec(vmpalTestRunner)); err == nil {
+		t.Fatal("the create succeeded on a host with a proven breach")
+	}
+	if r.credentialReachedGuest() {
+		t.Error("the registration went to a clone a breach had condemned")
+	}
+	r.assertNoCloneLeft()
+}
+
+// The stage change is not the last moment that matters: the purge can land
+// after it has passed and before the credential moves.
+func TestNoCredentialIsSentOnceACloneIsAbandonedAfterItsLastStageChange(t *testing.T) {
+	r := newVMPalRig(t)
+	name := r.b.vmName(vmpalTestRunner)
+	r.b.ledger.writeFile = func(path string, data []byte, mode os.FileMode) error {
+		if bytes.Contains(data, []byte(fmt.Sprintf("%q: %q", "stage", vmpalStageDelivering))) {
+			r.b.abandonLocked(name) // the ledger is written under mu
+		}
+		return writeFileAtomic(path, data, mode)
+	}
+	if _, err := r.b.Create(context.Background(), vmpalTestSpec(vmpalTestRunner)); err == nil {
+		t.Fatal("the create succeeded after its clone was abandoned")
+	}
+	if r.credentialReachedGuest() {
+		t.Error("the registration was sent after the clone was abandoned")
+	}
+	r.assertNoCloneLeft()
+}
+
+// A delivery already running when the breach is found is ended, not waited for.
+func TestAnAbandonCancelsADeliveryAlreadyInFlight(t *testing.T) {
+	r := newVMPalRig(t)
+	name := r.b.vmName(vmpalTestRunner)
+	r.fake.OnExec("helper.sh deliver", fakevmpal.ExecReply{Hang: true})
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.b.Create(context.Background(), vmpalTestSpec(vmpalTestRunner))
+		done <- err
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for len(r.execs("helper.sh deliver")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the delivery never started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	r.b.mu.Lock()
+	r.b.abandonLocked(name)
+	r.b.mu.Unlock()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the create succeeded after its clone was abandoned")
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the delivery ran on after the clone was abandoned")
+		<-done
+	}
+	if got := r.execs("helper.sh start"); len(got) != 0 {
+		t.Errorf("the runner was started in an abandoned clone: %v", got)
+	}
+	r.assertNoCloneLeft()
+}
+
+// With its exit unwritten and its delete failed, a purged clone must still
+// read as ended, or the agent would go on treating it as a live runner and
+// never ask for the delete to be retried.
+func TestAPurgedCloneWhoseExitCouldNotBeWrittenReportsThePurge(t *testing.T) {
+	r := newVMPalRig(t)
+	ctx := context.Background()
+	name := r.seed(vmpalStageRunning, func(e *vmpalEntry) { e.StartedAt = r.clock.Now() })
+	r.diskFull(true)
+	r.fake.Fail("delete", fakevmpal.Fault{Times: 1})
+	r.b.purgeClone(ctx, name)
+	r.diskFull(false)
+	st := r.workload(name).Status
+	if st.Phase != PhaseFailed || st.ExitCode != 1 || st.Message != vmpalPurgeMessage {
+		t.Errorf("listed as %+v, want the purge reported as a failure", st)
+	}
+	r.b.mu.Lock()
+	watched := r.b.watchers[name] != nil
+	r.b.mu.Unlock()
+	if watched {
+		t.Error("a watcher was started for a condemned clone")
+	}
+	if err := r.b.Remove(ctx, Handle(name)); err != nil {
+		t.Fatal(err)
+	}
+	r.assertNoCloneLeft()
+	r.b.mu.Lock()
+	defer r.b.mu.Unlock()
+	if r.b.abandoned[name] {
+		t.Error("the mark outlived the clone")
+	}
+}
+
+// GitHub's completed webhook can beat the guest writing its record, which it
+// does only after the runner has exited. Giving up on the first "running" would
+// lose the one piece of evidence that clears the breaker.
+func TestARemoveWaitsForAnExitRecordTheGuestHasNotWrittenYet(t *testing.T) {
+	r := newVMPalRig(t)
+	name := r.create()
+	r.b.finalRead, r.b.finalWait = 20*time.Second, 20*time.Second
+	r.fake.OnExec("helper.sh exit", fakevmpal.ExecReply{
+		Stdout: "zoomies-exit v1 running\n", Times: 2,
+		Then: &fakevmpal.ExecReply{Stdout: "zoomies-exit v1 code=0 job=1\n"},
+	})
+	if err := r.b.Remove(context.Background(), Handle(name)); err != nil {
+		t.Fatal(err)
+	}
+	r.assertExits([2]bool{true, false})
+	r.assertNoCloneLeft()
+}
+
+// The guest is untrusted and may never write a record, so how long it can hold
+// up its own delete has to be a number.
+func TestARemoveStopsWaitingForAnExitRecordWhenItsBudgetEnds(t *testing.T) {
+	r := newVMPalRig(t)
+	name := r.create()
+	r.b.finalRead, r.b.finalWait = 400*time.Millisecond, 400*time.Millisecond
+	started := time.Now()
+	if err := r.b.Remove(context.Background(), Handle(name)); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(started); took > 10*time.Second {
+		t.Errorf("the removal took %s", took)
+	}
+	if got := len(r.execs("helper.sh exit")); got < 2 {
+		t.Errorf("the guest was asked %d times, want it asked again while the budget lasted", got)
+	}
+	r.assertNoCloneLeft()
+	r.assertExits()
+}
+
+// The first force-off worked, so the VM being off is this process's doing. A
+// retry that fails says nothing about that.
+func TestARepeatedForceOffKeepsTheRecordOfTheFirst(t *testing.T) {
+	r := newVMPalRig(t)
+	name := r.create()
+	r.b.forceOff(name)
+	r.fake.Fail("stop", fakevmpal.Fault{})
+	r.b.forceOff(name)
+	if st := r.workload(name).Status; st.Phase != PhaseFailed {
+		t.Fatalf("listed as %+v", st)
+	}
+	r.assertExits()
+}
+
+func TestAForceOffThatFailedIsTriedAgain(t *testing.T) {
+	r := newVMPalRig(t)
+	name := r.create()
+	r.fake.Fail("stop", fakevmpal.Fault{Times: 1})
+	r.b.forceOff(name)
+	if vm, _ := r.fake.VM(name); vm.State != "running" {
+		t.Fatalf("the clone is %q after a stop that failed", vm.State)
+	}
+	r.b.forceOff(name)
+	if vm, _ := r.fake.VM(name); vm.State != "stopped" {
+		t.Errorf("the clone is %q, want the retry to have turned it off", vm.State)
+	}
+}
+
+// A restart or logout stops every clone and the agent with them. That is the
+// Mac's doing and says nothing about the template, so it must not trip a hold.
+func TestAMacRestartIsNotCountedAsAGuestPowerOff(t *testing.T) {
+	r := newVMPalRig(t)
+	name := r.create()
+	r.fake.Reboot()
+	r.restart()
+	if st := r.workload(name).Status; st.Phase != PhaseFailed {
+		t.Fatalf("listed as %+v", st)
+	}
+	if _, err := r.b.Status(context.Background(), Handle(name)); err != nil {
+		t.Fatal(err)
+	}
+	r.assertExits()
+}
+
+// The check that a record has gone and the look at what is being removed have
+// to be one fact: a removal finishing between them leaves a clone that is in
+// neither, which reads as lost from under its job.
+func TestARemovalFinishingInsideAListIsNotReportedAsLost(t *testing.T) {
+	r := newVMPalRig(t)
+	ctx := context.Background()
+	name := r.create()
+	r.b.stopWatcher(name)
+	r.b.mu.Lock()
+	r.b.removing[name] = true
+	r.b.mu.Unlock()
+	if err := r.b.cli.Delete(ctx, name); err != nil {
+		t.Fatal(err)
+	}
+	r.b.afterDropRemoved = func() {
+		if err := r.b.removeClone(ctx, name); err != nil {
+			t.Error(err)
+		}
+	}
+	if st := r.workload(name).Status; st.Phase != PhaseExitUnknown {
+		t.Errorf("listed as %s/%d (%q) while its removal finished", st.Phase, st.ExitCode, st.Message)
 	}
 }
