@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eyupio/zoomies/internal/store"
@@ -147,6 +148,13 @@ type VMPalOptions struct {
 
 // VMPalBackend runs each runner in its own clone.
 type VMPalBackend struct {
+	// probedHeld is whether the last Probe found a hold, and reprobe asks for a
+	// fresh one. A healthy host is probed every five minutes, and until the next
+	// probe the controller goes on minting registrations for a host that is
+	// refusing them.
+	probedHeld atomic.Bool
+	reprobe    atomic.Bool
+
 	cli         *vmpalCLI
 	goos        string
 	template    string
@@ -457,8 +465,10 @@ func (b *VMPalBackend) Probe(ctx context.Context) Info {
 	if b.goos != "darwin" {
 		return refuse("the macOS VM backend only runs on a Mac; this host runs " + b.goos)
 	}
-	if err := b.gate.Held(); err != nil {
-		return refuse(strings.TrimPrefix(err.Error(), "backend: "))
+	held := b.gate.Held()
+	b.probedHeld.Store(held != nil)
+	if held != nil {
+		return refuse(strings.TrimPrefix(held.Error(), "backend: "))
 	}
 	if b.policyCheck == "" {
 		return refuse("no network policy check is configured, so this host will not start VM runners; set agent.vmpal.policy_check")
@@ -483,6 +493,17 @@ func (b *VMPalBackend) Probe(ctx context.Context) Info {
 	}
 	info.Available = true
 	return info
+}
+
+var _ ProbeInvalidator = (*VMPalBackend)(nil)
+
+// ProbeStale says the last Probe no longer describes this host: a hold has
+// started or ended, or a clone failed. It clears on read, so each change costs
+// one extra probe.
+func (b *VMPalBackend) ProbeStale() bool {
+	held := b.gate.Held() != nil
+	changed := b.probedHeld.Swap(held) != held
+	return b.reprobe.Swap(false) || changed
 }
 
 // checkVMPalTemplate holds a template to what a clone of it needs.
@@ -668,6 +689,8 @@ func (b *VMPalBackend) endCreate(name string) {
 
 func (b *VMPalBackend) provision(ctx context.Context, name string, spec Spec, source vmpalRunnerSource, payload string) error {
 	if err := b.cli.Clone(ctx, b.template, name); err != nil {
+		// Most often the template has been started, which Probe reports.
+		b.reprobe.Store(true)
 		return err
 	}
 	cloned, err := b.cli.Info(ctx, name)

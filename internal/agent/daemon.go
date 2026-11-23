@@ -1233,9 +1233,14 @@ func (a *Agent) refreshBackends(ctx context.Context) []backend.Info {
 }
 
 // probeDue reports whether it is time to look again: always when the last probe
-// found nothing usable, and otherwise once every backendProbeInterval.
+// found nothing usable, when a backend says its answer has gone stale, and
+// otherwise once every backendProbeInterval.
 func (a *Agent) probeDue(last []backend.Info, at time.Time) bool {
-	if at.IsZero() {
+	// Asked first, and never short-circuited, because reading the flag clears
+	// it: a backend that went stale while nothing was available would
+	// otherwise keep its flag and force a second, pointless probe later.
+	stale := a.opts.Backends.ProbeStale()
+	if stale || at.IsZero() {
 		return true
 	}
 	if len(availableKinds(last)) == 0 {

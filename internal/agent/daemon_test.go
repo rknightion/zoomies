@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -646,6 +647,64 @@ func TestAgentDoesNotReprobeOnEveryHeartbeatWhenHealthy(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("no probe within 5s of %s passing", backendProbeInterval)
 		}
+	}
+}
+
+// staleBackend is a backend that can say its last probe no longer holds.
+type staleBackend struct {
+	*fakeBackend
+	stale atomic.Bool
+}
+
+func (s *staleBackend) ProbeStale() bool { return s.stale.Swap(false) }
+
+// A backend that knows its capability changed, such as a firewall policy that
+// stopped matching, must not wait out the probe interval: the host would keep
+// advertising a backend that is no longer safe to schedule on.
+func TestAgentReprobesOnceWhenABackendSaysItsProbeIsStale(t *testing.T) {
+	t.Parallel()
+	sb := &staleBackend{fakeBackend: newFakeBackend(store.BackendDocker)}
+	h := newHarness(t, 1, func(o *Options) { o.Backends = backend.NewRegistry(sb) })
+	base := sb.probeCount()
+
+	sb.stale.Store(true)
+	deadline := time.After(5 * time.Second)
+	for sb.probeCount() == base {
+		select {
+		case <-h.tr.beats:
+		case <-deadline:
+			t.Fatal("a stale flag did not force a re-probe within 5s")
+		}
+	}
+	if sb.stale.Load() {
+		t.Fatal("the stale flag was not cleared by being read")
+	}
+	// Further heartbeats, well inside the probe interval, must not probe again.
+	want := sb.probeCount()
+	for range 3 {
+		select {
+		case <-h.tr.beats:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no heartbeat within 5s")
+		}
+	}
+	if got := sb.probeCount(); got != want {
+		t.Fatalf("probes = %d after the flag was spent, want %d", got, want)
+	}
+}
+
+// A backend with no way to say it is stale keeps the interval it always had.
+func TestAgentKeepsTheProbeIntervalForABackendWithoutProbeStale(t *testing.T) {
+	t.Parallel()
+	a, _, _, clock := newAgent(t, 1)
+	at := clock.Now()
+	info := []backend.Info{{Kind: store.BackendDocker, Available: true}}
+	if a.probeDue(info, at) {
+		t.Fatal("a fresh probe of a healthy backend was due again at once")
+	}
+	clock.advance(backendProbeInterval)
+	if !a.probeDue(info, at) {
+		t.Fatal("the probe interval passed and no probe was due")
 	}
 }
 

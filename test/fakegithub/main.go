@@ -15,16 +15,50 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/eyupio/zoomies/internal/github"
 )
 
+// controlHandler lets a harness queue a job on the fake: POST /jobs with a JSON
+// body naming the repository, workflow, job and runs-on labels. It is how a
+// test that drives the real binary makes work appear without a real workflow.
+func controlHandler(fake *github.FakeGitHub) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Repo     string   `json:"repo"`
+			Workflow string   `json:"workflow"`
+			Job      string   `json:"job"`
+			Labels   []string `json:"labels"`
+		}
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			http.Error(w, "the body must be JSON with repo, workflow, job and labels: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Repo == "" || req.Workflow == "" || req.Job == "" {
+			http.Error(w, "repo, workflow and job are all required", http.StatusBadRequest)
+			return
+		}
+		job := fake.AddQueuedJob(req.Repo, req.Workflow, req.Job, req.Labels)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(job)
+	})
+	return mux
+}
+
 func main() {
+	control := flag.Bool("control", false, "also serve a loopback control route that queues jobs")
 	flag.Parse()
 
 	fake := github.NewFake()
@@ -46,6 +80,21 @@ func main() {
 	// listening on.
 	fmt.Printf("fakegithub url=%s app_id=%d installation_id=%d\n",
 		fake.URL(), fake.AppID(), fake.InstallationID())
+
+	// Off unless asked for, so the one line above stays the whole of what an
+	// existing harness sees. The route is bound to loopback only: it mutates
+	// the fake, and nothing off this machine should be able to.
+	if *control {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "fakegithub: cannot open the control port:", err)
+			os.Exit(1)
+		}
+		srv := &http.Server{Handler: controlHandler(fake), ReadHeaderTimeout: 5 * time.Second}
+		go func() { _ = srv.Serve(ln) }()
+		defer srv.Close()
+		fmt.Printf("fakegithub control=http://%s\n", ln.Addr())
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

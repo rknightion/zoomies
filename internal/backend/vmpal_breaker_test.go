@@ -422,3 +422,53 @@ func TestRunnersWhoseToolsStopAnsweringTripTheBreaker(t *testing.T) {
 		t.Fatalf("the fourth create returned %v, want a hold", err)
 	}
 }
+
+// Without this the controller keeps minting registrations for up to five
+// minutes for a host that is refusing them, and waits as long to use it again.
+func TestAHoldAndItsEndEachAskForOneFreshProbe(t *testing.T) {
+	r := newEgressRig(t, 1)
+	ctx := context.Background()
+	r.b.Probe(ctx)
+	if r.b.ProbeStale() {
+		t.Fatal("a fresh probe was called stale")
+	}
+	for i := range 3 {
+		h, err := r.b.Create(ctx, vmpalTestSpec(fmt.Sprintf("run_stale%d", i)))
+		if err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		if !r.b.endUnfollowable(string(h), "the guest stopped answering") {
+			t.Fatalf("runner %d was not ended", i)
+		}
+		if err := r.b.Remove(ctx, h); err != nil {
+			t.Fatalf("remove %d: %v", i, err)
+		}
+	}
+	if !r.b.ProbeStale() {
+		t.Fatal("a hold starting did not ask for a probe")
+	}
+	if r.b.ProbeStale() {
+		t.Fatal("one hold asked for a second probe")
+	}
+	r.clock.advance(11 * time.Minute)
+	if !r.b.ProbeStale() {
+		t.Fatal("a hold ending did not ask for a probe")
+	}
+	if r.b.ProbeStale() {
+		t.Fatal("one hold ending asked for a second probe")
+	}
+}
+
+func TestACloneThatFailsAsksForAFreshProbe(t *testing.T) {
+	r := newEgressRig(t, 1)
+	ctx := context.Background()
+	r.b.Probe(ctx)
+	r.b.ProbeStale()
+	r.fake.Fail("clone", fakevmpal.Fault{Stderr: "the template is running", ExitCode: 1, Times: 1})
+	if _, err := r.b.Create(ctx, vmpalTestSpec("run_clonefail")); err == nil {
+		t.Fatal("the create succeeded with a failing clone")
+	}
+	if !r.b.ProbeStale() {
+		t.Fatal("a failed clone did not ask for a probe")
+	}
+}

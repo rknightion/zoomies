@@ -663,6 +663,31 @@ func (r *Registry) RegistryMirrorReport() *RegistryMirrorReport {
 	return nil
 }
 
+// ProbeInvalidator is implemented by a backend whose capability can change
+// between probes for a reason the agent cannot see by waiting, such as a
+// firewall policy that stopped matching. ProbeStale reports whether that has
+// happened since the last call, and clears the answer as it reads it, so one
+// change costs one re-probe rather than one per heartbeat.
+type ProbeInvalidator interface {
+	ProbeStale() bool
+}
+
+// ProbeStale reports whether any backend asked for a fresh probe. It reads
+// every backend rather than stopping at the first, because each read clears
+// that backend's flag and a flag left set would force a second re-probe later.
+func (r *Registry) ProbeStale() bool {
+	if r == nil {
+		return false
+	}
+	stale := false
+	for _, b := range r.backends {
+		if p, ok := b.(ProbeInvalidator); ok && p.ProbeStale() {
+			stale = true
+		}
+	}
+	return stale
+}
+
 // Kinds returns the registered backend kinds.
 func (r *Registry) Kinds() []store.BackendKind {
 	out := make([]store.BackendKind, 0, len(r.backends))
