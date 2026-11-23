@@ -81,6 +81,7 @@ func runAgentDaemon(ctx context.Context, e *env, args []string) error {
 	if *joinToken != "" {
 		cfg.Agent.JoinToken = *joinToken
 	}
+	prepareVMPalAgent(cfg)
 	cfg.Agent.Name = claimedName(cfg.Agent.JoinToken, cfg.Agent.Name, machine.Hostname())
 	if cfg.Agent.ControllerURL == "" {
 		return errors.New("no controller to talk to: set agent.controller_url in zoomies.yaml, " +
@@ -96,7 +97,7 @@ func runAgentDaemon(ctx context.Context, e *env, args []string) error {
 	log, _ := setupLogging(cfg)
 	startWSLSelfManagement(ctx, log, cfg.Agent.WorkDir)
 
-	backends, err := buildBackends(ctx, cfg, log)
+	backends, err := buildAgentBackends(ctx, cfg, log)
 	if err != nil {
 		return err
 	}
@@ -251,10 +252,13 @@ func runAgentJoin(ctx context.Context, e *env, args []string) error {
 	nonInteractive := fs.Bool("non-interactive", false, "never prompt; a missing answer is an error naming it")
 	assumeYes := fs.Bool("yes", false, "answer yes to the one question a re-join asks; it does not answer the update helper's")
 	updateHelper := fs.Bool("update-helper", false, "add the update helper without asking, so that the web UI can update this host")
+	processIsolation := fs.String("process-isolation", "", "what keeps a job off this machine: vmpal runs each runner in a throwaway macOS VM, none runs it directly on the host (a Mac must say which)")
+	vmpalConfig := fs.String("vmpal-config", "", "YAML file holding the agent.vmpal settings, read and checked before the token is spent (needed with --process-isolation vmpal)")
 	fs.example(
 		"zoomies agent join https://zoomies.example.com --token zoojoin_...",
 		"zoomies agent join https://zoomies.example.com --token zoojoin_... --capacity 8 --labels arch=arm64",
 		"zoomies agent join https://zoomies.internal --token zoojoin_... --ca-file /etc/zoomies/controller.crt",
+		"zoomies agent join https://zoomies.example.com --token zoojoin_... --process-isolation vmpal --vmpal-config vmpal.yaml",
 	)
 	if err := fs.parse(args); err != nil {
 		return err
@@ -277,7 +281,7 @@ func runAgentJoin(ctx context.Context, e *env, args []string) error {
 	// must not take an answer off whatever its input happens to be.
 	interactive := canAsk(e, *nonInteractive)
 
-	return installer.Join(ctx, installer.JoinOptions{
+	return installerJoin(ctx, installer.JoinOptions{
 		ControllerURL:      strings.TrimRight(url, "/"),
 		JoinToken:          joinToken,
 		Name:               *name,
@@ -297,6 +301,8 @@ func runAgentJoin(ctx context.Context, e *env, args []string) error {
 		NonInteractive:     *nonInteractive,
 		AssumeYes:          *assumeYes,
 		UpdateHelper:       *updateHelper,
+		ProcessIsolation:   *processIsolation,
+		VMPalConfigFile:    *vmpalConfig,
 		Interactive:        interactive,
 		Out:                e.out,
 		In:                 e.in,

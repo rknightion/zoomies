@@ -142,6 +142,11 @@ than about what any one setting says.
 | `agent.workdir` | error | `agent.work_dir` | Empty. |
 | `agent.process_backend` | warning | `agent.backend` | The process backend gives jobs no container isolation: a job can read and write anything the agent user can. |
 | `agent.process_root` | warning | `agent.backend` | The process backend is running as root, so every job is root on the host. |
+| `agent.process_isolation_required` | error | `agent.process_isolation` | A remote agent on a Mac has no `process_isolation` in its config file, so it refuses to start rather than risk running jobs on the Mac. An environment variable does not count. Set `vmpal`, or `none` to run jobs directly on the Mac. |
+| `agent.vmpal_invalid` | error | `agent.process_isolation`, `agent.vmpal.*` | The isolation mode is unknown, or a VM setting is missing or malformed. The finding names the setting and what to write there. |
+| `agent.vmpal_not_macos` | error | `agent.process_isolation` | VM isolation is set on a host that is not a Mac. |
+| `agent.vmpal_embedded` | error | `agent.process_isolation` | VM isolation is set where a controller's embedded agent would run the jobs, or with no controller URL. It needs a standalone agent with `agent.embedded` false. |
+| `agent.vmpal_finished_retention` | error | `agent.finished_retention` | VM isolation with a non-zero retention: a finished clone would hold a VM slot the controller believes is free. Set it to `0s`. |
 | `agent.root` | warning | `agent` | The agent process is running as root. Raised only where an agent actually runs. |
 | `agent.insecure_tls` | warning | `agent.insecure_skip_verify` | The agent does not verify the controller's certificate, so anything on the path can impersonate it. |
 | `agent.insecure_http` | warning | `agent.allow_insecure_http` | The agent talks to the controller over plain HTTP, so its token and every runner's credentials cross the network in the clear. |

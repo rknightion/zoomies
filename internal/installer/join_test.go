@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -17,6 +18,9 @@ import (
 	"testing"
 
 	"github.com/eyupio/zoomies/internal/agent"
+	"github.com/eyupio/zoomies/internal/backend"
+	"github.com/eyupio/zoomies/internal/config"
+	"github.com/eyupio/zoomies/internal/store"
 )
 
 func TestExplainJoinErrorNamesTheRemedy(t *testing.T) {
@@ -498,5 +502,253 @@ func TestWithWSLSystemdKeepsTheRestOfTheFile(t *testing.T) {
 		if got := withWSLSystemd(in); got != want {
 			t.Errorf("withWSLSystemd(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// vmpalStubBackend answers the two questions a join asks of the VM backend. The
+// real one reports itself available only on a Mac with a working policy check.
+type vmpalStubBackend struct {
+	backend.Backend
+	info backend.Info
+}
+
+func (b vmpalStubBackend) Kind() store.BackendKind            { return store.BackendProcess }
+func (b vmpalStubBackend) Probe(context.Context) backend.Info { return b.info }
+
+func vmpalStub(info backend.Info) func(backend.VMPalOptions) (*backend.Registry, error) {
+	info.Kind = store.BackendProcess
+	info.Endpoint = "stub-vmpal"
+	return func(backend.VMPalOptions) (*backend.Registry, error) {
+		return backend.NewRegistry(vmpalStubBackend{info: info}), nil
+	}
+}
+
+const vmpalJoinFile = `agent:
+  vmpal:
+    template: example-macos-template
+    max_vms: 2
+    guest_cidr: 192.0.2.0/24
+    policy_check: /usr/local/libexec/example-policy-check
+    egress_must_allow: ["github.com:443"]
+    egress_must_block: ["198.51.100.10:443"]
+`
+
+func writeVMPalJoinFile(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "vmpal.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// joinController is a controller that accepts a join and records what it was told.
+type joinController struct {
+	*httptest.Server
+	contacted atomic.Int32
+	joined    agent.JoinRequest
+	beat      agent.HeartbeatRequest
+}
+
+func newJoinController(t *testing.T) *joinController {
+	t.Helper()
+	c := &joinController{}
+	c.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.contacted.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case agent.PathJoin:
+			_ = json.NewDecoder(r.Body).Decode(&c.joined)
+			_ = json.NewEncoder(w).Encode(agent.JoinResponse{HostID: "host-1", AgentToken: "zooagent_test", HeartbeatInterval: "30s"})
+		case agent.PathHeartbeat:
+			_ = json.NewDecoder(r.Body).Decode(&c.beat)
+			_ = json.NewEncoder(w).Encode(agent.HeartbeatResponse{OK: true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(c.Close)
+	return c
+}
+
+func vmpalJoinOptions(t *testing.T, url string) JoinOptions {
+	t.Helper()
+	return JoinOptions{
+		ControllerURL:     url,
+		JoinToken:         "zoojoin_test",
+		ConfigDir:         t.TempDir(),
+		StateDir:          t.TempDir(),
+		Service:           ServiceNone,
+		AllowInsecureHTTP: true,
+		NonInteractive:    true,
+		ProcessIsolation:  config.ProcessIsolationVMPal,
+		VMPalConfigFile:   writeVMPalJoinFile(t, vmpalJoinFile),
+		vmpalRegistry:     vmpalStub(backend.Info{Available: true}),
+		Out:               &strings.Builder{},
+		detection:         &Detection{OS: "darwin", Arch: "arm64", Hostname: "mac-01", User: "ada"},
+	}
+}
+
+// Every row here is refused with the token unspent: it is single use, and a host
+// refused after redeeming it is an offline record somebody has to clean up.
+func TestAJoinRefusesWhatCannotIsolateJobsBeforeSpendingTheToken(t *testing.T) {
+	const otherFailure = "the template is running; shut it down"
+	cases := []struct {
+		name   string
+		change func(*testing.T, *JoinOptions)
+		want   string
+		// probed is a refusal that needs the backend, so the work directory exists.
+		probed bool
+	}{
+		{name: "a Mac that was not asked", want: "--process-isolation", change: func(_ *testing.T, o *JoinOptions) {
+			o.ProcessIsolation, o.VMPalConfigFile = "", ""
+		}},
+		{name: "a mode that does not exist", want: "not a mode", change: func(_ *testing.T, o *JoinOptions) { o.ProcessIsolation = "VMPal" }},
+		{name: "vmpal with no file", want: "--vmpal-config", change: func(_ *testing.T, o *JoinOptions) { o.VMPalConfigFile = "" }},
+		{name: "none with a file", want: "--vmpal-config", change: func(_ *testing.T, o *JoinOptions) { o.ProcessIsolation = config.ProcessIsolationNone }},
+		{name: "a file with no mode", want: "--process-isolation", change: func(_ *testing.T, o *JoinOptions) { o.ProcessIsolation = "" }},
+		{name: "vmpal as root", want: "root", change: func(_ *testing.T, o *JoinOptions) {
+			det := *o.detection
+			det.Root = true
+			o.detection = &det
+		}},
+		{name: "vmpal with the docker backend", want: "--backend", change: func(_ *testing.T, o *JoinOptions) { o.Backend = store.BackendDocker }},
+		{name: "vmpal with the podman backend", want: "--backend", change: func(_ *testing.T, o *JoinOptions) { o.Backend = store.BackendPodman }},
+		{name: "vmpal with a Docker socket", want: "--docker-host", change: func(_ *testing.T, o *JoinOptions) { o.DockerHost = "unix:///var/run/docker.sock" }},
+		{name: "a capacity that is not max_vms", want: "--capacity", change: func(_ *testing.T, o *JoinOptions) { o.Capacity = 1 }},
+		{name: "a negative capacity", want: "--capacity", change: func(_ *testing.T, o *JoinOptions) { o.Capacity = -1 }},
+		{name: "a file with a misspelt key", want: "templte", change: func(t *testing.T, o *JoinOptions) {
+			o.VMPalConfigFile = writeVMPalJoinFile(t, "agent:\n  vmpal:\n    templte: example\n")
+		}},
+		{name: "a file missing a required value", want: "agent.vmpal.template", change: func(t *testing.T, o *JoinOptions) {
+			o.VMPalConfigFile = writeVMPalJoinFile(t, strings.Replace(vmpalJoinFile, "    template: example-macos-template\n", "", 1))
+		}},
+		{name: "a file that is not there", want: "VMPal settings", change: func(t *testing.T, o *JoinOptions) {
+			o.VMPalConfigFile = filepath.Join(t.TempDir(), "missing.yaml")
+		}},
+		{name: "a probe that fails for any other reason", want: otherFailure, probed: true, change: func(_ *testing.T, o *JoinOptions) {
+			o.vmpalRegistry = vmpalStub(backend.Info{Detail: otherFailure})
+		}},
+		{name: "a probe that says nothing", want: "not usable", probed: true, change: func(_ *testing.T, o *JoinOptions) {
+			o.vmpalRegistry = vmpalStub(backend.Info{})
+		}},
+		// The real backend, which this commit gives a gate that refuses every
+		// clone: its Probe is unavailable, so the join must not go ahead.
+		{name: "the real backend with no policy gate", want: "not usable", probed: true, change: func(_ *testing.T, o *JoinOptions) {
+			o.vmpalRegistry = nil
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := newJoinController(t)
+			opts := vmpalJoinOptions(t, ctrl.URL)
+			tc.change(t, &opts)
+
+			err := Join(context.Background(), opts)
+			if err == nil {
+				t.Fatal("the join was allowed")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the refusal should mention %q:\n%v", tc.want, err)
+			}
+			if !strings.Contains(err.Error(), "nothing has been redeemed") {
+				t.Errorf("the refusal should say the token is still good:\n%v", err)
+			}
+			if n := ctrl.contacted.Load(); n != 0 {
+				t.Errorf("the controller was contacted %d times; that spends the single-use token", n)
+			}
+			if _, statErr := os.Stat(filepath.Join(opts.StateDir, "work")); !tc.probed && statErr == nil {
+				t.Error("nothing should be written before a refusal of the flags")
+			}
+			if _, statErr := os.Stat(filepath.Join(opts.ConfigDir, "zoomies.yaml")); statErr == nil {
+				t.Error("a refused join wrote a config file")
+			}
+		})
+	}
+}
+
+func TestAVMJoinOffersOnlyTheVMBackendAndWritesWhatTheAgentNeeds(t *testing.T) {
+	// max_vms 1, because this detection's default capacity is 2 and a figure
+	// equal to the default would pass with the capacity rule gone.
+	for name, capacity := range map[string]int{"capacity left out": 0, "capacity equal to max_vms": 1} {
+		t.Run(name, func(t *testing.T) {
+			ctrl := newJoinController(t)
+			opts := vmpalJoinOptions(t, ctrl.URL)
+			opts.VMPalConfigFile = writeVMPalJoinFile(t, strings.Replace(vmpalJoinFile, "max_vms: 2", "max_vms: 1", 1))
+			opts.Capacity = capacity
+			if err := Join(context.Background(), opts); err != nil {
+				t.Fatal(err)
+			}
+
+			for what, sent := range map[string][]backend.Info{"join": ctrl.joined.Backends, "first heartbeat": ctrl.beat.Backends} {
+				if len(sent) != 1 || sent[0].Kind != store.BackendProcess || sent[0].Endpoint != "stub-vmpal" {
+					t.Errorf("the %s offered %+v; want the VM backend and nothing else", what, sent)
+				}
+			}
+			if ctrl.joined.Capacity != 1 || ctrl.beat.Capacity != 1 {
+				t.Errorf("capacity joined %d, heartbeat %d; want max_vms, 1", ctrl.joined.Capacity, ctrl.beat.Capacity)
+			}
+
+			cfg, err := config.Load(filepath.Join(opts.ConfigDir, "zoomies.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Agent.ProcessIsolation != config.ProcessIsolationVMPal || cfg.Source("agent.process_isolation") != config.SourceFile {
+				t.Errorf("isolation = %q from %s; want vmpal from the file", cfg.Agent.ProcessIsolation, cfg.Source("agent.process_isolation"))
+			}
+			if cfg.Agent.Backend != "process" || cfg.Agent.Embedded || cfg.Agent.Capacity != 1 || cfg.Agent.VMPal.MaxVMs != 1 || cfg.Agent.VMPal.Template != "example-macos-template" {
+				t.Errorf("the written agent is %+v", cfg.Agent)
+			}
+			if err := cfg.ProcessIsolationFindings("darwin").Err(); err != nil {
+				t.Errorf("the agent this join installed would refuse to start: %v", err)
+			}
+		})
+	}
+}
+
+// VMs somebody else is running clear when they shut down, and the host is held
+// back from taking work until they do. Nothing about the Mac itself is wrong.
+func TestAVMJoinGoesAheadWhenOtherVMsHoldEverySlot(t *testing.T) {
+	ctrl := newJoinController(t)
+	opts := vmpalJoinOptions(t, ctrl.URL)
+	detail := backend.VMPalSlotsOccupiedDetail + " 2 of this host's VM slots (other-vm); shut one down to free a slot"
+	opts.vmpalRegistry = vmpalStub(backend.Info{Detail: detail})
+	if err := Join(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if len(ctrl.joined.Backends) != 1 || ctrl.joined.Backends[0].Available {
+		t.Errorf("the join offered %+v; want the VM backend, reported as unavailable", ctrl.joined.Backends)
+	}
+}
+
+func TestAJoinWithoutVMsWritesTheChoiceItWasGiven(t *testing.T) {
+	cases := []struct {
+		name, os, mode string
+		wantSource     config.Source
+	}{
+		// Written, because a Mac's next start refuses a file without it.
+		{"none on a Mac", "darwin", config.ProcessIsolationNone, config.SourceFile},
+		{"none on Linux", "linux", config.ProcessIsolationNone, config.SourceFile},
+		// An ordinary Linux join is not asked and its file does not change.
+		{"nothing said on Linux", "linux", "", config.SourceDefault},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := newJoinController(t)
+			opts := vmpalJoinOptions(t, ctrl.URL)
+			opts.ProcessIsolation, opts.VMPalConfigFile, opts.vmpalRegistry = tc.mode, "", nil
+			opts.Backend = store.BackendProcess
+			opts.detection = &Detection{OS: tc.os, Arch: "arm64", Hostname: "host-01", User: "ada"}
+			if err := Join(context.Background(), opts); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(filepath.Join(opts.ConfigDir, "zoomies.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Agent.ProcessIsolation != tc.mode || cfg.Source("agent.process_isolation") != tc.wantSource {
+				t.Errorf("isolation = %q from %s; want %q from %s", cfg.Agent.ProcessIsolation, cfg.Source("agent.process_isolation"), tc.mode, tc.wantSource)
+			}
+		})
 	}
 }

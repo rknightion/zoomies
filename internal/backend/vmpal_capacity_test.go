@@ -208,6 +208,9 @@ func TestProbeIsUnavailableOnlyWhenForeignVMsHoldEverySlot(t *testing.T) {
 			if info.Available != tc.available {
 				t.Fatalf("available=%v: %s", info.Available, info.Detail)
 			}
+			if !tc.available && !strings.Contains(info.Detail, VMPalSlotsOccupiedDetail) {
+				t.Fatalf("a join would not recognise this as occupied slots: %s", info.Detail)
+			}
 			if !tc.available && !strings.Contains(info.Detail, "foreign-0") {
 				t.Errorf("the detail does not name the VMs in the way: %s", info.Detail)
 			}

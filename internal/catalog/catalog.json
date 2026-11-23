@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated_from": "1ead14f",
+  "generated_from": "8b56b07",
   "entries": [
     {
       "id": "agent.backend_missing",
@@ -239,6 +239,20 @@
       "docs_md": "https://github.com/eyupio/zoomies/blob/main/docs/problem-codes.md#configuration-the-agent"
     },
     {
+      "id": "agent.process_isolation_required",
+      "kind": "problem",
+      "title": "agent.process_isolation_required",
+      "category": "configuration",
+      "severity": "error",
+      "detection": "static",
+      "detects": "A remote agent on a Mac has no `process_isolation` in its config file, so it refuses to start rather than risk running jobs on the Mac. An environment variable does not count. Set `vmpal`, or `none` to run jobs directly on the Mac.",
+      "fix": "A remote agent on a Mac has no `process_isolation` in its config file, so it refuses to start rather than risk running jobs on the Mac. An environment variable does not count. Set `vmpal`, or `none` to run jobs directly on the Mac.",
+      "verify": null,
+      "setting": "agent.process_isolation",
+      "docs_html": "https://zoomies.sh/problem-codes/#configuration-the-agent",
+      "docs_md": "https://github.com/eyupio/zoomies/blob/main/docs/problem-codes.md#configuration-the-agent"
+    },
+    {
       "id": "agent.process_root",
       "kind": "problem",
       "title": "agent.process_root",
@@ -291,6 +305,62 @@
       "fix": "The process backend may install a runner archive whose checksum it could not confirm.",
       "verify": null,
       "setting": "agent.allow_unverified_runner_download",
+      "docs_html": "https://zoomies.sh/problem-codes/#configuration-the-agent",
+      "docs_md": "https://github.com/eyupio/zoomies/blob/main/docs/problem-codes.md#configuration-the-agent"
+    },
+    {
+      "id": "agent.vmpal_embedded",
+      "kind": "problem",
+      "title": "agent.vmpal_embedded",
+      "category": "configuration",
+      "severity": "error",
+      "detection": "static",
+      "detects": "VM isolation is set where a controller's embedded agent would run the jobs, or with no controller URL. It needs a standalone agent with `agent.embedded` false.",
+      "fix": "VM isolation is set where a controller's embedded agent would run the jobs, or with no controller URL. It needs a standalone agent with `agent.embedded` false.",
+      "verify": null,
+      "setting": "agent.process_isolation",
+      "docs_html": "https://zoomies.sh/problem-codes/#configuration-the-agent",
+      "docs_md": "https://github.com/eyupio/zoomies/blob/main/docs/problem-codes.md#configuration-the-agent"
+    },
+    {
+      "id": "agent.vmpal_finished_retention",
+      "kind": "problem",
+      "title": "agent.vmpal_finished_retention",
+      "category": "configuration",
+      "severity": "error",
+      "detection": "static",
+      "detects": "VM isolation with a non-zero retention: a finished clone would hold a VM slot the controller believes is free. Set it to `0s`.",
+      "fix": "VM isolation with a non-zero retention: a finished clone would hold a VM slot the controller believes is free. Set it to `0s`.",
+      "verify": null,
+      "setting": "agent.finished_retention",
+      "docs_html": "https://zoomies.sh/problem-codes/#configuration-the-agent",
+      "docs_md": "https://github.com/eyupio/zoomies/blob/main/docs/problem-codes.md#configuration-the-agent"
+    },
+    {
+      "id": "agent.vmpal_invalid",
+      "kind": "problem",
+      "title": "agent.vmpal_invalid",
+      "category": "configuration",
+      "severity": "error",
+      "detection": "static",
+      "detects": "The isolation mode is unknown, or a VM setting is missing or malformed. The finding names the setting and what to write there.",
+      "fix": "The isolation mode is unknown, or a VM setting is missing or malformed. The finding names the setting and what to write there.",
+      "verify": null,
+      "setting": "agent.process_isolation`, `agent.vmpal.*",
+      "docs_html": "https://zoomies.sh/problem-codes/#configuration-the-agent",
+      "docs_md": "https://github.com/eyupio/zoomies/blob/main/docs/problem-codes.md#configuration-the-agent"
+    },
+    {
+      "id": "agent.vmpal_not_macos",
+      "kind": "problem",
+      "title": "agent.vmpal_not_macos",
+      "category": "configuration",
+      "severity": "error",
+      "detection": "static",
+      "detects": "VM isolation is set on a host that is not a Mac.",
+      "fix": "VM isolation is set on a host that is not a Mac.",
+      "verify": null,
+      "setting": "agent.process_isolation",
       "docs_html": "https://zoomies.sh/problem-codes/#configuration-the-agent",
       "docs_md": "https://github.com/eyupio/zoomies/blob/main/docs/problem-codes.md#configuration-the-agent"
     },

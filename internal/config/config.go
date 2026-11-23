@@ -9,6 +9,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -822,6 +823,78 @@ type Agent struct {
 	// RegistryMirror is the pull-through mirror of Docker Hub's public images
 	// that a host offers the docker-in-docker sidecars it starts.
 	RegistryMirror RegistryMirror `yaml:"registry_mirror"`
+	// ProcessIsolation says what stands between a process-backend job and this
+	// machine: "vmpal" is a throwaway macOS VM per runner and "none" is nothing.
+	// Empty is "nobody said", which a remote agent on a Mac refuses, because a
+	// build that had lost the setting would otherwise run jobs on the Mac itself.
+	ProcessIsolation string `yaml:"process_isolation"`
+	// VMPal configures the macOS VM backend that ProcessIsolation "vmpal" selects.
+	VMPal VMPalConfig `yaml:"vmpal"`
+}
+
+// The values of agent.process_isolation.
+const (
+	ProcessIsolationNone  = "none"
+	ProcessIsolationVMPal = "vmpal"
+)
+
+// DefaultVMPalBinary is where VMPal installs its command.
+const DefaultVMPalBinary = "/usr/local/bin/vmpal"
+
+// VMPalConfig is how this agent makes its macOS VMs. Nothing here has a usable
+// default except the command and the VM count: a guessed template or network
+// would be a guess about what keeps a job away from the host.
+type VMPalConfig struct {
+	// Binary is the vmpal command.
+	Binary string `yaml:"binary"`
+	// Template is the shut-down VM every clone is made from.
+	Template string `yaml:"template"`
+	// MaxVMs is how many clones this agent may hold at once. Apple allows two
+	// macOS VMs on one Mac, counting those of every other app.
+	MaxVMs int `yaml:"max_vms"`
+	// CPUs and MemoryGB size each clone. Zero inherits the template's size.
+	CPUs     int `yaml:"cpus"`
+	MemoryGB int `yaml:"memory_gb"`
+	// GuestCIDR is the IPv4 network a clone must come up on.
+	GuestCIDR string `yaml:"guest_cidr"`
+	// PolicyCheck is the command that attests the host's firewall policy.
+	PolicyCheck string `yaml:"policy_check"`
+	// EgressMustAllow and EgressMustBlock are the host:port targets a clone's
+	// network is checked against before it is given a credential. The blocked
+	// ones are IP literals, so that a resolver cannot make the check pass.
+	EgressMustAllow []string `yaml:"egress_must_allow"`
+	EgressMustBlock []string `yaml:"egress_must_block"`
+}
+
+// LoadVMPalFile reads the file `zoomies agent join --vmpal-config` is given.
+//
+// It is decoded strictly and holds agent.vmpal and nothing else: the join spends
+// a single-use token on what this file says, so a misspelt key has to stop the
+// join here and not leave a setting at its default.
+func LoadVMPalFile(path string) (VMPalConfig, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return VMPalConfig{}, fmt.Errorf("reading the VMPal settings: %w", err)
+	}
+	var doc struct {
+		Agent struct {
+			VMPal VMPalConfig `yaml:"vmpal"`
+		} `yaml:"agent"`
+	}
+	doc.Agent.VMPal = Default().Agent.VMPal
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&doc); err != nil {
+		if errors.Is(err, io.EOF) {
+			return VMPalConfig{}, fmt.Errorf("%s is empty; it needs an agent.vmpal section", path)
+		}
+		return VMPalConfig{}, fmt.Errorf("%s: %w; it may hold only agent.vmpal settings", path, err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return VMPalConfig{}, fmt.Errorf("%s holds more than one YAML document; keep only the agent.vmpal settings", path)
+	}
+	return doc.Agent.VMPal, nil
 }
 
 // MinRegistryMirrorBytes is the smallest size a registry mirror may be given
@@ -1312,6 +1385,7 @@ func Default() *Config {
 			PrewarmTimeout:     5 * time.Minute,
 			PrewarmJitter:      30 * time.Second,
 			DockerBuildCacheMB: 0,
+			VMPal:              VMPalConfig{Binary: DefaultVMPalBinary, MaxVMs: 1},
 		},
 		Scheduler: Scheduler{
 			Interval:          10 * time.Second,

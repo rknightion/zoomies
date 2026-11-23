@@ -1145,3 +1145,284 @@ func TestAPublicViewIsAWarningUnlessAuthenticationIsOffAnyway(t *testing.T) {
 		t.Errorf("auth.public_view raised beside auth.disabled: %s", f.Title)
 	}
 }
+
+// vmpalReady is a configuration VM isolation can run with, so that each test
+// below is about the one thing it changes.
+func vmpalReady() *Config {
+	c := Default()
+	c.Agent.Embedded = false
+	c.Agent.ControllerURL = "https://zoomies.example.com"
+	c.Agent.Backend = "process"
+	c.Agent.ProcessIsolation = ProcessIsolationVMPal
+	c.Agent.VMPal = VMPalConfig{
+		Binary:          DefaultVMPalBinary,
+		Template:        "example-macos-template",
+		MaxVMs:          1,
+		GuestCIDR:       "192.0.2.0/24",
+		PolicyCheck:     "/usr/local/libexec/example-policy-check",
+		EgressMustAllow: []string{"github.com:443"},
+		EgressMustBlock: []string{"198.51.100.10:443"},
+	}
+	c.note("agent.process_isolation", SourceFile)
+	return c
+}
+
+func agentFindingsOn(c *Config, goos string) Findings {
+	var out Findings
+	c.validateAgentOn(goos, func(f Finding) { out = append(out, f) })
+	return out
+}
+
+// A stock build ignores an environment variable it does not know and runs the
+// job on the Mac, while it refuses a config file holding a key it does not know.
+// So only a value in the file proves the build reading it understands isolation.
+func TestAMacAgentMustHaveItsIsolationInItsConfigFile(t *testing.T) {
+	const head = "agent:\n  embedded: false\n  controller_url: https://zoomies.example.com\n"
+	cases := []struct {
+		name     string
+		file     string
+		env      string
+		noFile   bool
+		required bool
+	}{
+		{name: "vmpal in the file", file: head + "  process_isolation: vmpal\n"},
+		{name: "none in the file", file: head + "  process_isolation: none\n"},
+		{name: "an empty value in the file", file: head + "  process_isolation: \"\"\n", required: true},
+		{name: "a YAML null in the file", file: head + "  process_isolation: null\n", required: true},
+		{name: "a key with no value in the file", file: head + "  process_isolation:\n", required: true},
+		{name: "absent from the file", file: head, required: true},
+		{name: "in the environment only", file: head, env: "vmpal", required: true},
+		{name: "in the file but overridden by the environment", file: head + "  process_isolation: vmpal\n", env: "none", required: true},
+		{name: "flags only, with no file", noFile: true, required: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c *Config
+			if tc.noFile {
+				c = Default()
+				c.Agent.ControllerURL = "https://zoomies.example.com"
+			} else {
+				path := filepath.Join(t.TempDir(), "zoomies.yaml")
+				if err := os.WriteFile(path, []byte(tc.file), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if tc.env != "" {
+					t.Setenv("ZOOMIES_AGENT_PROCESS_ISOLATION", tc.env)
+				}
+				var err error
+				if c, err = Load(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := hasCode(agentFindingsOn(c, "darwin"), "agent.process_isolation_required"); got != tc.required {
+				t.Errorf("on a Mac, agent.process_isolation_required raised = %v, want %v", got, tc.required)
+			}
+			if hasCode(agentFindingsOn(c, "linux"), "agent.process_isolation_required") {
+				t.Error("the rule is a Mac's, and a Linux agent was held to it")
+			}
+		})
+	}
+}
+
+// The embedded agent of a Mac used for development has no controller URL, and
+// must go on starting without anybody writing an isolation setting.
+func TestAMacControllerWithAnEmbeddedAgentNeedsNoIsolationSetting(t *testing.T) {
+	if hasCode(agentFindingsOn(Default(), "darwin"), "agent.process_isolation_required") {
+		t.Fatal("a default embedded agent on a Mac was refused")
+	}
+}
+
+func TestVMPalRefusesEveryValueItCannotRunWith(t *testing.T) {
+	cases := []struct {
+		name    string
+		setting string
+		change  func(*VMPalConfig)
+	}{
+		{"a relative command", "agent.vmpal.binary", func(v *VMPalConfig) { v.Binary = "bin/vmpal" }},
+		{"no template", "agent.vmpal.template", func(v *VMPalConfig) { v.Template = " " }},
+		{"a template read as a flag", "agent.vmpal.template", func(v *VMPalConfig) { v.Template = "--force" }},
+		{"no VMs", "agent.vmpal.max_vms", func(v *VMPalConfig) { v.MaxVMs = 0 }},
+		{"more VMs than Apple allows", "agent.vmpal.max_vms", func(v *VMPalConfig) { v.MaxVMs = 3 }},
+		{"one CPU", "agent.vmpal.cpus", func(v *VMPalConfig) { v.CPUs = 1 }},
+		{"negative CPUs", "agent.vmpal.cpus", func(v *VMPalConfig) { v.CPUs = -2 }},
+		{"too little memory", "agent.vmpal.memory_gb", func(v *VMPalConfig) { v.MemoryGB = 3 }},
+		{"no guest network", "agent.vmpal.guest_cidr", func(v *VMPalConfig) { v.GuestCIDR = "" }},
+		{"an address with no prefix", "agent.vmpal.guest_cidr", func(v *VMPalConfig) { v.GuestCIDR = "192.0.2.1" }},
+		{"an IPv6 guest network", "agent.vmpal.guest_cidr", func(v *VMPalConfig) { v.GuestCIDR = "2001:db8::/64" }},
+		{"an IPv4-mapped guest network", "agent.vmpal.guest_cidr", func(v *VMPalConfig) { v.GuestCIDR = "::ffff:192.0.2.0/120" }},
+		{"no policy check", "agent.vmpal.policy_check", func(v *VMPalConfig) { v.PolicyCheck = "" }},
+		{"a relative policy check", "agent.vmpal.policy_check", func(v *VMPalConfig) { v.PolicyCheck = "check.sh" }},
+		{"nothing that must work", "agent.vmpal.egress_must_allow", func(v *VMPalConfig) { v.EgressMustAllow = nil }},
+		{"an allow target with no port", "agent.vmpal.egress_must_allow", func(v *VMPalConfig) { v.EgressMustAllow = []string{"github.com"} }},
+		{"an allow target on port zero", "agent.vmpal.egress_must_allow", func(v *VMPalConfig) { v.EgressMustAllow = []string{"github.com:0"} }},
+		{"nothing that must fail", "agent.vmpal.egress_must_block", func(v *VMPalConfig) { v.EgressMustBlock = nil }},
+		{"a block target by name", "agent.vmpal.egress_must_block", func(v *VMPalConfig) { v.EgressMustBlock = []string{"example.com:443"} }},
+		{"a block target with no port", "agent.vmpal.egress_must_block", func(v *VMPalConfig) { v.EgressMustBlock = []string{"198.51.100.10"} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := vmpalReady()
+			tc.change(&c.Agent.VMPal)
+			var got *Finding
+			for _, f := range agentFindingsOn(c, "darwin") {
+				if f.Code == "agent.vmpal_invalid" && f.Setting == tc.setting {
+					got = &f
+				}
+			}
+			if got == nil {
+				t.Fatalf("no agent.vmpal_invalid naming %s", tc.setting)
+			}
+			if got.Severity != SeverityError || got.Fix == "" {
+				t.Errorf("finding = %+v; want an error that says what to change", *got)
+			}
+		})
+	}
+}
+
+func TestVMPalAcceptsEveryValueTheSettingsPromise(t *testing.T) {
+	cases := map[string]func(*VMPalConfig){
+		"the template's own size": func(v *VMPalConfig) { v.CPUs, v.MemoryGB = 0, 0 },
+		"the smallest clone":      func(v *VMPalConfig) { v.CPUs, v.MemoryGB = 2, 4 },
+		"two VMs":                 func(v *VMPalConfig) { v.MaxVMs = 2 },
+		"an IPv6 block target":    func(v *VMPalConfig) { v.EgressMustBlock = []string{"[2001:db8::1]:443"} },
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := vmpalReady()
+			change(&c.Agent.VMPal)
+			if err := c.ProcessIsolationFindings("darwin").Err(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestAnIsolationModeNobodyDefinedIsRefused(t *testing.T) {
+	// Compared exactly: a spelling that was accepted and then not recognised as
+	// vmpal would register the bare process backend.
+	for _, value := range []string{"VMPal", " vmpal", "vm", "docker"} {
+		c := vmpalReady()
+		c.Agent.ProcessIsolation = value
+		f := find(agentFindingsOn(c, "darwin"), "agent.vmpal_invalid")
+		if f.Severity != SeverityError || f.Setting != "agent.process_isolation" {
+			t.Errorf("%q: finding = %+v; want an error naming agent.process_isolation", value, f)
+		}
+	}
+}
+
+func TestVMPalIsRefusedAwayFromAMac(t *testing.T) {
+	if VMPalAnyOS {
+		t.Skip("this build is the test-only one that allows any operating system")
+	}
+	if f := find(agentFindingsOn(vmpalReady(), "linux"), "agent.vmpal_not_macos"); f.Severity != SeverityError {
+		t.Fatalf("finding = %+v; want an error", f)
+	}
+	if hasCode(agentFindingsOn(vmpalReady(), "darwin"), "agent.vmpal_not_macos") {
+		t.Fatal("a Mac was told it is not one")
+	}
+}
+
+// A controller's embedded agent builds its registry without reading this
+// setting, so vmpal there would run jobs on the Mac with a clean validation.
+func TestVMPalIsRefusedWhereAControllerWouldRunTheJobs(t *testing.T) {
+	cases := map[string]func(*Config){
+		"no controller URL":                func(c *Config) { c.Agent.ControllerURL = "" },
+		"embedded, with a controller URL":  func(c *Config) { c.Agent.Embedded = true },
+		"embedded, with no controller URL": func(c *Config) { c.Agent.Embedded, c.Agent.ControllerURL = true, "" },
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := vmpalReady()
+			change(c)
+			if f := find(agentFindingsOn(c, "darwin"), "agent.vmpal_embedded"); f.Severity != SeverityError {
+				t.Fatalf("finding = %+v; want an error", f)
+			}
+		})
+	}
+	if hasCode(agentFindingsOn(vmpalReady(), "darwin"), "agent.vmpal_embedded") {
+		t.Fatal("a standalone agent was refused as an embedded one")
+	}
+}
+
+// A finished clone kept for inspection holds a VM slot the controller believes
+// is free, and Apple allows only two.
+func TestVMPalRefusesToKeepFinishedRunners(t *testing.T) {
+	c := vmpalReady()
+	c.Agent.FinishedRetention = time.Minute
+	f := find(agentFindingsOn(c, "darwin"), "agent.vmpal_finished_retention")
+	if f.Severity != SeverityError || f.Setting != "agent.finished_retention" {
+		t.Fatalf("finding = %+v; want an error naming agent.finished_retention", f)
+	}
+}
+
+func TestTheProcessBackendWarningIsNotRaisedForAVMRunner(t *testing.T) {
+	if hasCode(agentFindingsOn(vmpalReady(), "darwin"), "agent.process_backend") {
+		t.Error("it says steps run directly on this host, which is false in a VM")
+	}
+	c := vmpalReady()
+	c.Agent.ProcessIsolation = ProcessIsolationNone
+	if !hasCode(agentFindingsOn(c, "darwin"), "agent.process_backend") {
+		t.Error("none runs jobs directly on the host, and the warning must say so")
+	}
+}
+
+func TestTheVMPalJoinFileIsReadStrictly(t *testing.T) {
+	const good = "agent:\n  vmpal:\n    template: example-macos-template\n    guest_cidr: 192.0.2.0/24\n"
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "vmpal.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	got, err := LoadVMPalFile(write(t, good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Template != "example-macos-template" || got.MaxVMs != 1 || got.Binary != DefaultVMPalBinary {
+		t.Errorf("settings = %+v; want the file's values over the defaults", got)
+	}
+
+	for name, body := range map[string]string{
+		"a misspelt key":        "agent:\n  vmpal:\n    templte: example\n",
+		"another agent setting": "agent:\n  name: builder\n  vmpal:\n    template: example\n",
+		"another section":       good + "server:\n  bind: 127.0.0.1:8080\n",
+		"a second document":     good + "---\nagent:\n  vmpal:\n    template: other\n",
+		"nothing at all":        "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadVMPalFile(write(t, body)); err == nil {
+				t.Fatal("the file was accepted")
+			}
+		})
+	}
+}
+
+// Save leaves out whatever equals the default, so these have to differ from it
+// or the next start on a Mac would find no isolation setting and refuse.
+func TestTheIsolationSettingsSurviveBeingSaved(t *testing.T) {
+	for _, mode := range []string{ProcessIsolationNone, ProcessIsolationVMPal} {
+		t.Run(mode, func(t *testing.T) {
+			c := vmpalReady()
+			c.Agent.ProcessIsolation = mode
+			c.Agent.VMPal.MaxVMs = 2
+			path := filepath.Join(t.TempDir(), "zoomies.yaml")
+			if err := c.Save(path); err != nil {
+				t.Fatal(err)
+			}
+			got, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Agent.ProcessIsolation != mode || got.Source("agent.process_isolation") != SourceFile {
+				t.Fatalf("isolation = %q from %s; want %q from the file", got.Agent.ProcessIsolation, got.Source("agent.process_isolation"), mode)
+			}
+			if got.Agent.VMPal.Template != c.Agent.VMPal.Template || got.Agent.VMPal.MaxVMs != 2 ||
+				len(got.Agent.VMPal.EgressMustBlock) != 1 || got.Agent.VMPal.EgressMustBlock[0] != "198.51.100.10:443" {
+				t.Errorf("settings came back as %+v", got.Agent.VMPal)
+			}
+		})
+	}
+}

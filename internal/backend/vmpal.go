@@ -66,6 +66,11 @@ const (
 	vmpalDefaultBinary = "/usr/local/bin/vmpal"
 )
 
+// VMPalSlotsOccupiedDetail opens Probe's answer when VMs Zoomies does not manage
+// hold every slot. The installer reads it, because that host works and is only
+// full for now, and Info has no reason field to carry it without a wire change.
+const VMPalSlotsOccupiedDetail = "macOS VMs Zoomies does not manage hold all"
+
 // vmpalGate decides whether a clone may be made and whether a booted clone may receive a credential.
 type vmpalGate interface {
 	// Held says why this host is refusing new clones for now, or nil. It runs
@@ -482,7 +487,7 @@ func (b *VMPalBackend) Probe(ctx context.Context) Info {
 	// Only other people's VMs can make this host unavailable. Its own clones
 	// filling every slot is a busy host doing its job.
 	if foreign := countVMPalSlots(vms, nil, b.ownedRunner).Foreign; len(foreign) >= vmpalSlotLimit(b.maxVMs) {
-		return refuse(fmt.Sprintf("macOS VMs Zoomies does not manage hold all %d of this host's VM slots (%s); shut one down to free a slot", vmpalSlotLimit(b.maxVMs), strings.Join(foreign, ", ")))
+		return refuse(fmt.Sprintf("%s %d of this host's VM slots (%s); shut one down to free a slot", VMPalSlotsOccupiedDetail, vmpalSlotLimit(b.maxVMs), strings.Join(foreign, ", ")))
 	}
 	template, err := b.cli.Info(ctx, b.template)
 	if err != nil {

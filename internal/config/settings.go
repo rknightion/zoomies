@@ -552,6 +552,59 @@ var registry = buildRegistry([]Setting{
 		Key: "agent.allow_insecure_http", Label: "Allow plain HTTP to the controller", Env: "ZOOMIES_AGENT_ALLOW_INSECURE_HTTP", Kind: KindBool, Scope: ScopeLocal,
 		Summary: "Let a standalone agent use a plain http:// controller URL off loopback, which puts its token and every runner credential on the wire in the clear. It is configured on that agent's own host.",
 	},
+	{
+		Key: "agent.process_isolation", Label: "Process isolation", Env: "ZOOMIES_AGENT_PROCESS_ISOLATION", Kind: KindEnum, Scope: ScopeLocal,
+		// Empty is a choice because it is the default, "nobody said", and the
+		// stored text of a default has to parse back. A Mac refuses it.
+		Choices:       []string{"", ProcessIsolationNone, ProcessIsolationVMPal},
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "What keeps a process-backend job off this machine: vmpal runs each runner in a throwaway macOS VM, none runs it directly on the host. A remote agent on a Mac must have this in its config file.",
+	},
+	{
+		Key: "agent.vmpal.binary", Label: "VMPal command", Env: "ZOOMIES_AGENT_VMPAL_BINARY", Kind: KindString, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "The absolute path of the vmpal command.",
+	},
+	{
+		Key: "agent.vmpal.template", Label: "VMPal template", Env: "ZOOMIES_AGENT_VMPAL_TEMPLATE", Kind: KindString, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "The shut-down macOS VM every runner is cloned from. Required with vmpal isolation.",
+	},
+	{
+		Key: "agent.vmpal.max_vms", Label: "VMPal runners at once", Env: "ZOOMIES_AGENT_VMPAL_MAX_VMS", Kind: KindInt, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "How many VM runners this Mac may hold at once: 1 or 2, because Apple allows two macOS VMs on one Mac.",
+	},
+	{
+		Key: "agent.vmpal.cpus", Label: "VMPal CPUs per runner", Env: "ZOOMIES_AGENT_VMPAL_CPUS", Kind: KindInt, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "CPUs for each VM runner: 0 inherits the template, otherwise at least 2.",
+	},
+	{
+		Key: "agent.vmpal.memory_gb", Label: "VMPal memory per runner", Env: "ZOOMIES_AGENT_VMPAL_MEMORY_GB", Kind: KindInt, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "Memory in GB for each VM runner: 0 inherits the template, otherwise at least 4.",
+	},
+	{
+		Key: "agent.vmpal.guest_cidr", Label: "VMPal guest network", Env: "ZOOMIES_AGENT_VMPAL_GUEST_CIDR", Kind: KindString, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "The IPv4 network a clone must come up on. Required with vmpal isolation.",
+	},
+	{
+		Key: "agent.vmpal.policy_check", Label: "VMPal policy check", Env: "ZOOMIES_AGENT_VMPAL_POLICY_CHECK", Kind: KindString, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "The absolute path of the command that attests this Mac's firewall policy. Required with vmpal isolation.",
+	},
+	{
+		Key: "agent.vmpal.egress_must_allow", Label: "VMPal egress that must work", Env: "ZOOMIES_AGENT_VMPAL_EGRESS_MUST_ALLOW", Kind: KindStrings, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "The host:port targets a clone must reach before it is given a credential. Required with vmpal isolation.",
+	},
+	{
+		Key: "agent.vmpal.egress_must_block", Label: "VMPal egress that must fail", Env: "ZOOMIES_AGENT_VMPAL_EGRESS_MUST_BLOCK", Kind: KindStrings, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "The IP-literal host:port targets a clone must not reach before it is given a credential. Required with vmpal isolation.",
+	},
 
 	// ---------------------------------------------------------------------
 	// runners -- what every runner is started with. The controller writes

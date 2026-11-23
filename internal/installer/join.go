@@ -70,6 +70,11 @@ type JoinOptions struct {
 	// UpdateHelper adds the update helper without asking, so that the web UI can
 	// update this host (UpdateHelperExplained).
 	UpdateHelper bool
+	// ProcessIsolation is agent.process_isolation: "vmpal", "none", or empty for
+	// a host that was not asked. A Mac must be asked (decideJoinIsolation).
+	ProcessIsolation string
+	// VMPalConfigFile holds the agent.vmpal settings, for "vmpal" and only then.
+	VMPalConfigFile string
 	// Interactive is whether a person is at a terminal to answer a question that
 	// defaults to no. NonInteractive alone cannot say it: a join run with neither
 	// flag and no terminal would otherwise read an answer off whatever its input
@@ -87,6 +92,11 @@ type JoinOptions struct {
 	// from the host and the commands it runs, as in UpgradeOptions.
 	helperHost *upgradeHelperHost
 	run        commandRunner
+
+	// vmpalRegistry stands in for backend.NewVMPalRegistry. The real backend only
+	// reports itself available on a Mac with a working network policy check, and
+	// a test has neither.
+	vmpalRegistry func(backend.VMPalOptions) (*backend.Registry, error)
 }
 
 func (o JoinOptions) configDir() string {
@@ -154,6 +164,14 @@ func Join(ctx context.Context, opts JoinOptions) error {
 		}
 	}
 
+	// Before anything is written or redeemed, for the same reason as the check
+	// below: the token is single use, and a host refused after spending it is
+	// left as an offline record on the controller.
+	isolation, err := decideJoinIsolation(opts, det)
+	if err != nil {
+		return err
+	}
+
 	// Decided before anything is written or redeemed. The join token is single
 	// use, and the unit goes to /etc/systemd/system, which a user without root
 	// cannot write: finding that out after a.Join leaves a spent token,
@@ -181,6 +199,10 @@ func Join(ctx context.Context, opts JoinOptions) error {
 	capacity := opts.Capacity
 	if capacity <= 0 {
 		capacity = defaultCapacity(det)
+	}
+	if isolation.usesVMPal() {
+		// decideJoinIsolation has refused any other figure that was asked for.
+		capacity = isolation.vmpal.MaxVMs
 	}
 	serviceUser, serviceGroup := opts.ServiceUser, opts.ServiceUser
 	if serviceUser == "" {
@@ -210,9 +232,22 @@ func Join(ctx context.Context, opts JoinOptions) error {
 
 	// --- Backends -------------------------------------------------------
 	u.step("Backends")
-	registry, chosen, err := buildRegistry(ctx, det, opts, workDir)
-	if err != nil {
-		return err
+	var registry *backend.Registry
+	var chosen store.BackendKind
+	if isolation.usesVMPal() {
+		// Never buildRegistry: it would offer Docker and the bare process backend,
+		// and either one is a way for a job to run on the Mac itself.
+		registry, err = opts.newVMPalRegistry(isolation.vmpal, workDir, log)
+		if err != nil {
+			return fmt.Errorf("installer: the VM backend cannot start, and nothing has been redeemed: %w", err)
+		}
+		defer registry.Close()
+		chosen = store.BackendProcess
+	} else {
+		registry, chosen, err = buildRegistry(ctx, det, opts, workDir)
+		if err != nil {
+			return err
+		}
 	}
 	infos := registry.Probe(ctx)
 	for _, info := range infos {
@@ -222,7 +257,14 @@ func Join(ctx context.Context, opts JoinOptions) error {
 			u.note(fmt.Sprintf("%s unavailable: %s", info.Kind, firstLine(info.Detail)))
 		}
 	}
-	u.ok("this host will run jobs with the " + string(chosen) + " backend")
+	if isolation.usesVMPal() {
+		if err := refuseVMPalProbe(infos); err != nil {
+			return err
+		}
+		u.ok("this host will run each job in its own macOS VM")
+	} else {
+		u.ok("this host will run jobs with the " + string(chosen) + " backend")
+	}
 	for _, info := range infos {
 		if info.Kind == chosen {
 			ensureCgroupDelegation(ctx, u, det, info.Kind, info.Rootless, info.Endpoint, info.Limits, runCommand)
@@ -299,6 +341,11 @@ func Join(ctx context.Context, opts JoinOptions) error {
 	cfg.Agent.InsecureSkipVerify = opts.InsecureSkipVerify
 	cfg.Agent.AllowInsecureHTTP = opts.AllowInsecureHTTP
 	cfg.Agent.Labels = opts.Labels
+	// Written even as "none": on a Mac the next start refuses a file without it.
+	cfg.Agent.ProcessIsolation = isolation.mode
+	if isolation.usesVMPal() {
+		cfg.Agent.VMPal = isolation.vmpal
+	}
 	cfg.Database.Path = filepath.Join(opts.stateDir(), "agent.db")
 	// The agent token lives in the credentials file the join just wrote, with
 	// mode 0600, and never in the config file: zoomies.yaml is 0640 and ends up
@@ -513,6 +560,129 @@ func buildRegistry(ctx context.Context, det Detection, opts JoinOptions, workDir
 	}
 	return nil, "", errors.New("installer: this host has no usable backend: no Docker or Podman socket answered, and the process backend could not be prepared. " +
 		"Start a runtime (systemctl --user start docker, or systemctl --user enable --now podman.socket) and run the join again")
+}
+
+// joinIsolation is what a join decided about how this host's jobs are isolated.
+type joinIsolation struct {
+	mode  string
+	vmpal config.VMPalConfig
+}
+
+func (i joinIsolation) usesVMPal() bool { return i.mode == config.ProcessIsolationVMPal }
+
+// decideJoinIsolation applies the join's rules for process isolation. It writes
+// nothing and contacts nothing, so that every refusal leaves the token unspent.
+func decideJoinIsolation(opts JoinOptions, det Detection) (joinIsolation, error) {
+	const unspent = "nothing has been redeemed"
+	mode, file := opts.ProcessIsolation, opts.VMPalConfigFile
+	switch mode {
+	case "", config.ProcessIsolationNone, config.ProcessIsolationVMPal:
+	default:
+		return joinIsolation{}, fmt.Errorf("installer: --process-isolation %q is not a mode; use vmpal or none. %s", mode, unspent)
+	}
+	if mode == "" && det.OS == "darwin" {
+		return joinIsolation{}, fmt.Errorf("installer: on a Mac, say what keeps jobs off this machine: run zoomies agent join "+
+			"with --process-isolation vmpal --vmpal-config <file> to run each job in a VM, or --process-isolation none to run "+
+			"jobs directly on this Mac; %s", unspent)
+	}
+	if mode != config.ProcessIsolationVMPal {
+		if file != "" {
+			return joinIsolation{}, fmt.Errorf("installer: --vmpal-config only applies with --process-isolation vmpal; "+
+				"add that flag or remove the file. %s", unspent)
+		}
+		return joinIsolation{mode: mode}, nil
+	}
+
+	if file == "" {
+		return joinIsolation{}, fmt.Errorf("installer: --process-isolation vmpal needs --vmpal-config <file> holding the agent.vmpal settings; %s", unspent)
+	}
+	if det.Root {
+		return joinIsolation{}, fmt.Errorf("installer: VM isolation must be joined as the logged-in user and not as root, "+
+			"because root would install a LaunchDaemon outside the session VMPal runs in. Run this again without sudo; %s", unspent)
+	}
+	if opts.Backend != "" && opts.Backend != store.BackendProcess {
+		return joinIsolation{}, fmt.Errorf("installer: --backend %s cannot be used with --process-isolation vmpal, which only runs "+
+			"jobs in VMs. Remove --backend; %s", opts.Backend, unspent)
+	}
+	if opts.DockerHost != "" {
+		return joinIsolation{}, fmt.Errorf("installer: --docker-host cannot be used with --process-isolation vmpal, which never "+
+			"uses a container runtime. Remove it; %s", unspent)
+	}
+	settings, err := config.LoadVMPalFile(file)
+	if err != nil {
+		return joinIsolation{}, fmt.Errorf("installer: %w; %s", err, unspent)
+	}
+	if opts.Capacity != 0 && opts.Capacity != settings.MaxVMs {
+		return joinIsolation{}, fmt.Errorf("installer: --capacity %d does not match max_vms %d in %s. Leave --capacity out, "+
+			"or make them equal; %s", opts.Capacity, settings.MaxVMs, file, unspent)
+	}
+	candidate := config.Default()
+	candidate.Agent.Embedded = false
+	candidate.Agent.ControllerURL = opts.ControllerURL
+	candidate.Agent.ProcessIsolation = mode
+	candidate.Agent.VMPal = settings
+	// The file this join writes is where the value will come from.
+	candidate.Note("agent.process_isolation", config.SourceFile)
+	if err := candidate.ProcessIsolationFindings(det.OS).Err(); err != nil {
+		return joinIsolation{}, fmt.Errorf("installer: %s cannot be used, and %s: %w", file, unspent, err)
+	}
+	return joinIsolation{mode: mode, vmpal: settings}, nil
+}
+
+// newVMPalRegistry builds the VM-only registry from what the join decided.
+func (o JoinOptions) newVMPalRegistry(settings config.VMPalConfig, workDir string, log *slog.Logger) (*backend.Registry, error) {
+	cfg := config.Default()
+	cfg.Agent.WorkDir = workDir
+	cfg.Agent.VMPal = settings
+	build := o.vmpalRegistry
+	if build == nil {
+		build = backend.NewVMPalRegistry
+	}
+	return build(VMPalBackendOptions(cfg, log))
+}
+
+// VMPalBackendOptions is the one place the settings become the backend's
+// options, so that a join and the agent it installs cannot build different ones.
+func VMPalBackendOptions(cfg *config.Config, log *slog.Logger) backend.VMPalOptions {
+	v := cfg.Agent.VMPal
+	opts := backend.VMPalOptions{
+		Binary:          v.Binary,
+		Template:        v.Template,
+		MaxVMs:          v.MaxVMs,
+		GuestCIDR:       v.GuestCIDR,
+		EgressMustAllow: v.EgressMustAllow,
+		EgressMustBlock: v.EgressMustBlock,
+		PolicyCheck:     v.PolicyCheck,
+		CPUs:            v.CPUs,
+		MemoryGB:        v.MemoryGB,
+		WorkDir:         cfg.Agent.WorkDir,
+		RunnerVersion:   cfg.GitHub.RunnerVersion,
+		RunnerSHA256:    cfg.Agent.RunnerSHA256,
+		DownloadBaseURL: cfg.Agent.RunnerDownloadURL,
+		Logger:          log,
+	}
+	if config.VMPalAnyOS {
+		// The test build drives a fake vmpal on Linux, and the backend would
+		// otherwise refuse the host before it asked the fake anything.
+		opts.GOOS = "darwin"
+	}
+	return opts
+}
+
+// refuseVMPalProbe stops a join on any probe failure except occupied VM slots.
+// Those are a state of the moment that clears when somebody shuts a VM down,
+// and every other failure is a host that could not safely run a job.
+func refuseVMPalProbe(infos []backend.Info) error {
+	if len(infos) == 0 {
+		return errors.New("installer: the VM backend reported nothing, so this host cannot be shown to work; nothing has been redeemed")
+	}
+	for _, info := range infos {
+		if info.Available || strings.Contains(info.Detail, backend.VMPalSlotsOccupiedDetail) {
+			continue
+		}
+		return fmt.Errorf("installer: the VM backend is not usable here: %s. Fix that and run this again; nothing has been redeemed", firstLine(info.Detail))
+	}
+	return nil
 }
 
 // explainJoinError turns a transport failure into an instruction. The five

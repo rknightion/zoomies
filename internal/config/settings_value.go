@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -491,6 +492,8 @@ func TidyDuration(d time.Duration) string {
 
 // orList reads the way somebody would say it: "debug, info, warn or error".
 func orList(items []string) string {
+	// An empty choice is "leave it unset", which nobody is told to write.
+	items = slices.DeleteFunc(slices.Clone(items), func(s string) bool { return s == "" })
 	switch len(items) {
 	case 0:
 		return ""

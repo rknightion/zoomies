@@ -132,6 +132,15 @@ otherwise, see [Naming](naming.md)), `--capacity`,
 `--non-interactive` with `--yes` for automation, and `--update-helper` to add the
 [update helper](security.md#what-the-agent-owns-on-a-host) without being asked.
 
+On a Mac, `agent join` must be told what keeps jobs off the machine, and refuses
+before spending the token otherwise. `--process-isolation vmpal` runs each runner
+in a throwaway macOS VM, and takes the settings from `--vmpal-config <file>`, a
+YAML file holding only `agent.vmpal`. `--process-isolation none` runs jobs
+directly on the Mac. With `vmpal`, the join runs as the logged-in user and never
+as root, takes no `--docker-host` and no `--backend` other than `process`, and
+`--capacity` is `max_vms` or left out. It is refused if the VM backend's check
+fails for any reason other than VMs Zoomies does not manage holding every slot.
+
 ## Your fleet
 
 ### `zoomies status`

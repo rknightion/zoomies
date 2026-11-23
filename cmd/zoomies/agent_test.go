@@ -64,7 +64,7 @@ func TestAgentJoinNeedsAControllerURL(t *testing.T) {
 func TestAgentWithNoCredentialsExplainsHowToRejoinAPrivateConnection(t *testing.T) {
 	e, _, errOut := newTestEnv(t)
 	dir := isolateHost(t)
-	path := writeConfig(t, "agent:\n  embedded: false\n  controller_url: tailcat://controller\n  work_dir: "+filepath.Join(dir, "work")+"\n")
+	path := writeConfig(t, "agent:\n  embedded: false\n  process_isolation: none\n  controller_url: tailcat://controller\n  work_dir: "+filepath.Join(dir, "work")+"\n")
 
 	if code := dispatch(context.Background(), e, []string{"agent", "--config", path}); code != exitError {
 		t.Fatalf("exit code = %d, want %d\n%s", code, exitError, errOut)
@@ -95,7 +95,7 @@ func TestAgentWithATailcatHostMissingItsAddressNamesTheStateFile(t *testing.T) {
 	if err := os.WriteFile(statePath, []byte(`{"host_id":"host_x","agent_token":"tok","controller_url":"tailcat://controller"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	path := writeConfig(t, "agent:\n  embedded: false\n  controller_url: tailcat://controller\n  work_dir: "+workDir+"\n")
+	path := writeConfig(t, "agent:\n  embedded: false\n  process_isolation: none\n  controller_url: tailcat://controller\n  work_dir: "+workDir+"\n")
 
 	if code := dispatch(context.Background(), e, []string{"agent", "--config", path}); code != exitError {
 		t.Fatalf("exit code = %d, want %d\n%s", code, exitError, errOut)

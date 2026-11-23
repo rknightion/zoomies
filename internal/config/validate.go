@@ -5,12 +5,14 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -823,8 +825,15 @@ func (c *Config) validateAuthentication(add func(Finding)) {
 	}
 }
 
-// validateAgent checks the agent and its backends.
+// validateAgent checks the agent and its backends on this operating system.
 func (c *Config) validateAgent(add func(Finding)) {
+	c.validateAgentOn(runtime.GOOS, add)
+}
+
+// validateAgentOn is validateAgent for a named operating system, because what a
+// Mac must refuse has to be testable on the Linux machines that run the tests.
+func (c *Config) validateAgentOn(goos string, add func(Finding)) {
+	c.validateProcessIsolation(goos, add)
 	if c.runsAgent() {
 		switch c.Agent.Backend {
 		case "docker", "podman", "process":
@@ -848,7 +857,9 @@ func (c *Config) validateAgent(add func(Finding)) {
 				Fix:   fmt.Sprintf("this host has %d CPUs; %d is a reasonable starting point.", runtime.NumCPU(), defaultCapacity()),
 			})
 		}
-		if c.Agent.Backend == "process" {
+		// With VM isolation the steps run in a throwaway guest, so a warning that
+		// they run directly on this host would be false.
+		if c.Agent.Backend == "process" && c.Agent.ProcessIsolation != ProcessIsolationVMPal {
 			add(Finding{
 				Code: "agent.process_backend", Severity: SeverityWarning, Setting: "agent.backend",
 				Title: "the process backend gives jobs no container isolation",
@@ -973,6 +984,145 @@ func (c *Config) validateAgent(add func(Finding)) {
 			Fix:    fmt.Sprintf("keep agent.heartbeat_interval at %s or less.", MaxQuietHeartbeatInterval),
 		})
 	}
+}
+
+// ProcessIsolationFindings is the part of Validate that decides whether this
+// configuration may run jobs on goos. A join asks it about the host it is on
+// before spending its single-use token.
+func (c *Config) ProcessIsolationFindings(goos string) Findings {
+	var out Findings
+	c.validateProcessIsolation(goos, func(f Finding) { out = append(out, f) })
+	return out
+}
+
+// validateProcessIsolation holds the promise that losing the isolation setting
+// can never turn into running jobs on the Mac.
+func (c *Config) validateProcessIsolation(goos string, add func(Finding)) {
+	value := c.Agent.ProcessIsolation
+	// Only the file counts. A build that does not know this setting ignores an
+	// environment variable and runs the job on the host, but it refuses a config
+	// file holding a key it does not know, and that refusal is the safe failure.
+	// agent.embedded is deliberately not part of this: it stays true on a
+	// flags-only `zoomies agent --controller` start.
+	if goos == "darwin" && c.Agent.ControllerURL != "" && (c.Source("agent.process_isolation") != SourceFile || value == "") {
+		add(Finding{
+			Code: "agent.process_isolation_required", Severity: SeverityError, Setting: "agent.process_isolation",
+			Title:  "a remote agent on a Mac must have agent.process_isolation in its config file",
+			Detail: "without it this agent could run workflow steps directly on the Mac. A value from the environment does not count, because a build that did not know the setting would ignore it.",
+			Fix:    "add process_isolation: vmpal under agent: in zoomies.yaml to run each job in a VM, or process_isolation: none to run jobs directly on this Mac.",
+		})
+	}
+	c.refuseUnknownChoice(add, Finding{
+		Code: "agent.vmpal_invalid", Severity: SeverityError, Setting: "agent.process_isolation",
+		Title: fmt.Sprintf("%q is not a process isolation mode", value),
+	}, value)
+	if value != ProcessIsolationVMPal {
+		return
+	}
+	if goos != "darwin" && !VMPalAnyOS {
+		add(Finding{
+			Code: "agent.vmpal_not_macos", Severity: SeverityError, Setting: "agent.process_isolation",
+			Title:  "VMPal isolation only runs on a Mac",
+			Detail: "this host runs " + goos + ", and VMPal makes macOS VMs with Apple's virtualisation framework.",
+			Fix:    "remove agent.process_isolation on this host, or move this agent to a Mac.",
+		})
+	}
+	// A controller with an embedded agent builds its backends without asking
+	// about isolation, so vmpal there would put jobs on the Mac itself, even
+	// with a controller URL in the file. `zoomies agent` clears the embedded
+	// default for itself before it validates.
+	if c.Agent.ControllerURL == "" || c.Agent.Embedded {
+		add(Finding{
+			Code: "agent.vmpal_embedded", Severity: SeverityError, Setting: "agent.process_isolation",
+			Title:  "VMPal isolation needs a standalone agent",
+			Detail: "the agent embedded in a controller does not use the VM backend, so its jobs would run directly on this host.",
+			Fix:    "run this Mac as a standalone agent with `zoomies agent join`, with agent.embedded false and agent.controller_url set.",
+		})
+	}
+	if c.Agent.FinishedRetention != 0 {
+		add(Finding{
+			Code: "agent.vmpal_finished_retention", Severity: SeverityError, Setting: "agent.finished_retention",
+			Title:  "VMPal isolation cannot keep finished runners",
+			Detail: "a finished clone kept for inspection would hold a VM slot the controller believes is free.",
+			Fix:    "set agent.finished_retention to 0s on this host.",
+		})
+	}
+	for _, p := range c.Agent.VMPal.problems() {
+		add(Finding{
+			Code: "agent.vmpal_invalid", Severity: SeverityError, Setting: p.setting,
+			Title: p.title,
+			Fix:   p.fix,
+		})
+	}
+}
+
+// vmpalProblem is one value VM isolation cannot run with.
+type vmpalProblem struct{ setting, title, fix string }
+
+// problems lists every value that is missing or malformed, all at once, so that
+// an operator fixing the file does not meet them one restart at a time.
+func (v VMPalConfig) problems() []vmpalProblem {
+	var out []vmpalProblem
+	bad := func(key, title, fix string) {
+		out = append(out, vmpalProblem{setting: "agent.vmpal." + key, title: title, fix: fix})
+	}
+	if !strings.HasPrefix(v.Binary, "/") {
+		bad("binary", "agent.vmpal.binary must be an absolute path", "use "+DefaultVMPalBinary+", where VMPal installs its command.")
+	}
+	if strings.TrimSpace(v.Template) == "" || strings.HasPrefix(v.Template, "-") {
+		bad("template", "agent.vmpal.template must name a VM", "set it to the name of the shut-down macOS VM to clone.")
+	}
+	if v.MaxVMs != 1 && v.MaxVMs != 2 {
+		bad("max_vms", fmt.Sprintf("agent.vmpal.max_vms is %d", v.MaxVMs), "use 1 or 2: Apple allows two macOS VMs on one Mac.")
+	}
+	if v.CPUs != 0 && v.CPUs < 2 {
+		bad("cpus", fmt.Sprintf("agent.vmpal.cpus is %d", v.CPUs), "use 0 to inherit the template's size, or at least 2.")
+	}
+	if v.MemoryGB != 0 && v.MemoryGB < 4 {
+		bad("memory_gb", fmt.Sprintf("agent.vmpal.memory_gb is %d", v.MemoryGB), "use 0 to inherit the template's size, or at least 4.")
+	}
+	// netip and not net.ParseCIDR, which reads ::ffff:192.0.2.0/120 as IPv4.
+	if p, err := netip.ParsePrefix(strings.TrimSpace(v.GuestCIDR)); err != nil || !p.Addr().Is4() {
+		bad("guest_cidr", "agent.vmpal.guest_cidr must be an IPv4 network", "use the network VMPal gives its guests, such as 192.0.2.0/24.")
+	}
+	if !strings.HasPrefix(v.PolicyCheck, "/") {
+		bad("policy_check", "agent.vmpal.policy_check must be an absolute path", "set it to the command that attests this Mac's firewall policy.")
+	}
+	if len(v.EgressMustAllow) == 0 {
+		bad("egress_must_allow", "agent.vmpal.egress_must_allow is empty", "list at least one host:port a job must reach, such as github.com:443.")
+	}
+	for _, target := range v.EgressMustAllow {
+		if _, ok := vmpalHostPort(target); !ok {
+			bad("egress_must_allow", fmt.Sprintf("%q in agent.vmpal.egress_must_allow is not host:port", target), "write each target as host:port, such as github.com:443.")
+		}
+	}
+	if len(v.EgressMustBlock) == 0 {
+		bad("egress_must_block", "agent.vmpal.egress_must_block is empty", "list at least one IP address and port a job must not reach, such as 198.51.100.10:443.")
+	}
+	for _, target := range v.EgressMustBlock {
+		host, ok := vmpalHostPort(target)
+		if ok {
+			_, err := netip.ParseAddr(host)
+			ok = err == nil
+		}
+		if !ok {
+			bad("egress_must_block", fmt.Sprintf("%q in agent.vmpal.egress_must_block is not an IP address and port", target), "write each target as an IP literal and port, such as 198.51.100.10:443, so that no resolver can make the check pass.")
+		}
+	}
+	return out
+}
+
+// vmpalHostPort splits host:port and holds the port to a real one.
+func vmpalHostPort(target string) (string, bool) {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil || host == "" {
+		return "", false
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || n == 0 {
+		return "", false
+	}
+	return host, true
 }
 
 // validateRunners checks the runners' own settings, and the warning for running them as root.
@@ -1896,6 +2046,8 @@ func (c *Config) refuseUnknownChoice(add func(Finding), finding Finding, value s
 
 // joinChoices reads a list aloud: "off, shadow or on", "none or dind".
 func joinChoices(choices []string) string {
+	// An empty choice is "leave it unset", which nobody is told to write.
+	choices = slices.DeleteFunc(slices.Clone(choices), func(c string) bool { return c == "" })
 	switch len(choices) {
 	case 0:
 		return ""
