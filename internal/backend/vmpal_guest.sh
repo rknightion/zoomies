@@ -7,8 +7,9 @@
 # else as a failure of that step. Once a job has run, the guest belongs to the
 # job, so nothing here is trusted by the host either.
 #
-# PATH is fixed for the helper's own commands and restored for the runner, whose
-# jobs are entitled to the one the account was given.
+# PATH is fixed for the helper's own commands. The runner gets the one it was
+# started with, which under launchd is only the system folders, so the usual
+# tool folders are added after them.
 
 set -u
 umask 077
@@ -193,7 +194,17 @@ cmd_run() {
 		write_exit 1 0
 		die "there was no runner registration to read"
 	fi
+	# Homebrew goes last so nothing in it can shadow the Xcode toolchain. A pool's
+	# own settings are read after these defaults and win.
 	PATH=$RUNNER_PATH
+	for dir in /usr/local/bin /opt/homebrew/bin /opt/homebrew/sbin; do
+		case ":$PATH:" in
+		*":$dir:"*) ;;
+		*) PATH=$PATH:$dir ;;
+		esac
+	done
+	export PATH
+	export LANG="${LANG:-en_US.UTF-8}" LC_ALL="${LC_ALL:-en_US.UTF-8}"
 	if [ -f "$ENV_FILE" ]; then
 		while IFS= read -r line || [ -n "$line" ]; do
 			name=${line%%=*}

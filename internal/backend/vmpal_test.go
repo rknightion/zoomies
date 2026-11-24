@@ -1733,6 +1733,34 @@ func TestTheHelperRecordsWhetherARunnerTookAJob(t *testing.T) {
 	}
 }
 
+// launchd starts the runner with only the system folders on PATH, so without
+// this a job cannot find a tool the template installed with Homebrew. Homebrew
+// comes last so nothing in it shadows the Xcode toolchain, and a pool's own
+// setting still wins over the defaults.
+func TestTheRunnerFindsTheTemplatesToolsAndAUTF8Locale(t *testing.T) {
+	g := newGuestRig(t)
+	payload := base64.StdEncoding.EncodeToString([]byte("LC_ALL=C\n"))
+	if _, err := g.run([]string{"ACTIONS_RUNNER_INPUT_JITCONFIG=x", "ZOOMIES_ENV_B64=" + payload}, "deliver"); err != nil {
+		t.Fatal(err)
+	}
+	g.runner(`printf '%s\n%s\n%s\n' "$PATH" "${LANG:-}" "${LC_ALL:-}" > "$HOME/seen"`)
+	g.run(nil, "run")
+	b, err := os.ReadFile(filepath.Join(g.home, "seen"))
+	if err != nil {
+		t.Fatalf("the runner did not run: %v", err)
+	}
+	got := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(got) != 3 {
+		t.Fatalf("runner saw %q", b)
+	}
+	if !strings.HasPrefix(got[0], "/usr/bin:/bin") || !strings.HasSuffix(got[0], ":/usr/local/bin:/opt/homebrew/bin:/opt/homebrew/sbin") {
+		t.Errorf("runner PATH is %q", got[0])
+	}
+	if got[1] != "en_US.UTF-8" || got[2] != "C" {
+		t.Errorf("runner locale is LANG=%q LC_ALL=%q, want en_US.UTF-8 and the pool's C", got[1], got[2])
+	}
+}
+
 // Stop works by SIGINT to the service, and the wrapper is what launchd signals.
 // If it died of the signal the runner would never be told and no record written.
 func TestTheHelperPassesAStopToTheRunnerAndRecordsItsExit(t *testing.T) {
