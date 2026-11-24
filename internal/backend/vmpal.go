@@ -564,6 +564,12 @@ func (b *VMPalBackend) ProbeStale() bool {
 	return b.reprobe.Swap(false) || changed
 }
 
+var _ SlotSized = (*VMPalBackend)(nil)
+
+// SlotSized is true: every runner gets a clone of its own, and the host's
+// capacity is its VM limit, not a share of the Mac's cores and memory.
+func (b *VMPalBackend) SlotSized() bool { return true }
+
 // checkVMPalTemplate holds a template to what a clone of it needs.
 func checkVMPalTemplate(t vmpalInfo) error {
 	switch {

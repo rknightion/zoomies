@@ -315,6 +315,15 @@ func TestReportedSizeSaysWhatTheAgentMeasuredOrThatItCouldNot(t *testing.T) {
 			not:  []string{"0 vCPU"},
 		},
 		{
+			// A host that runs each job in a VM of its own leaves its cores
+			// and memory out, so the controller cannot size it past its VM
+			// limit, and reports its disk alone.
+			name: "a VM host, which reports only its disk",
+			in:   agent.Reported{DiskTotalMB: 743 * 1024, DiskFreeMB: 98 * 1024},
+			want: []string{"98 GB free of 743"},
+			not:  []string{"0 vCPU", "not reported"},
+		},
+		{
 			name: "cpus but no disk",
 			in:   agent.Reported{CPUs: 4, MemoryMB: 8 * 1024},
 			want: []string{"4 vCPU", "8 GB"},

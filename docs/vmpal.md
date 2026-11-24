@@ -215,8 +215,10 @@ believes is free. The configuration findings this raises are in
 
 Apple allows two macOS VMs to run at once on a Mac, counting VMs from other
 apps. The host's capacity is `agent.vmpal.max_vms` (1 or 2), which join sets as
-the host's capacity, and the agent turns `auto_adjust` off so the scheduler
-places no more than that. Start with one, and raise it to two once you have
+the host's capacity. The agent reports the Mac's disk but not its cores or
+memory, so the controller's automatic capacity adjustment has nothing to size the
+host from and leaves that number alone. A host enrolled by an older build keeps
+the size it reported then, so turn `auto_adjust` off in its settings. Start with one, and raise it to two once you have
 shown that clones cannot reach each other and that two creates fit the
 provision timeout.
 

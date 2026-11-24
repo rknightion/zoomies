@@ -289,3 +289,65 @@ func TestTheAgentReportsTheHostItCanActuallyFill(t *testing.T) {
 		t.Fatal("no heartbeat was sent")
 	}
 }
+
+// slotSizedBackend runs each runner in a machine of its own, as a VM clone does.
+type slotSizedBackend struct{ *fakeBackend }
+
+func (slotSizedBackend) SlotSized() bool { return true }
+
+// A Mac that runs each job in a VM holds only as many runners as its VM limit,
+// but the controller keeps a host at the capacity its cores and memory
+// recommend unless an operator has turned that off. Reporting the Mac's size
+// let a two-VM host be raised to eighteen runners; the controller never
+// resizes a host that has not said how big it is. The disk is still reported,
+// because the clones live on it.
+func TestAHostThatRunsEachRunnerInItsOwnVMReportsNoCPUsOrMemory(t *testing.T) {
+	tr := newFakeTransport()
+	be := slotSizedBackend{newFakeBackend(store.BackendProcess)}
+	be.cpus, be.memoryMB = 10, 32_768
+
+	a, err := New(Options{
+		Name:              "mac-1",
+		WorkDir:           t.TempDir(),
+		Capacity:          2,
+		Backends:          backend.NewRegistry(be),
+		DefaultBackend:    store.BackendProcess,
+		Transport:         tr,
+		HeartbeatInterval: time.Second,
+		Logger:            testLogger(),
+		Machine:           &machine.Facts{OS: "darwin", Arch: "arm64", CPUs: 10, MemoryMB: 32_768},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := a.Join(context.Background(), "join-token"); err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if tr.joinReq == nil {
+		t.Fatal("the agent sent no join request")
+	}
+	if tr.joinReq.CPUs != 0 || tr.joinReq.MemoryMB != 0 {
+		t.Errorf("join reported %d CPUs and %d MB; the controller would size this host from them past its VM limit",
+			tr.joinReq.CPUs, tr.joinReq.MemoryMB)
+	}
+	wantTotal, _ := a.workDirSpace()
+	if wantTotal != 0 && tr.joinReq.DiskTotalMB != wantTotal {
+		t.Errorf("join reported %d MB of disk, want the work directory's %d MB", tr.joinReq.DiskTotalMB, wantTotal)
+	}
+
+	if err := a.heartbeat(context.Background()); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	select {
+	case beat := <-tr.beats:
+		if beat.CPUs != 0 || beat.MemoryMB != 0 {
+			t.Errorf("the beat reported %d CPUs and %d MB; the controller would size this host from them past its VM limit",
+				beat.CPUs, beat.MemoryMB)
+		}
+		if wantTotal != 0 && beat.DiskTotalMB != wantTotal {
+			t.Errorf("the beat reported %d MB of disk, want the work directory's %d MB", beat.DiskTotalMB, wantTotal)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no heartbeat was sent")
+	}
+}

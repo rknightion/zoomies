@@ -670,7 +670,7 @@ func (a *Agent) Join(ctx context.Context, joinToken string) error {
 	a.mu.Unlock()
 
 	m := a.machine()
-	cpus, memoryMB := hostSize(infos, m)
+	cpus, memoryMB := a.reportedSize(infos, m)
 	total, free := a.workDirSpace()
 	req := JoinRequest{
 		ProtocolVersion: ProtocolVersion,
@@ -1062,6 +1062,7 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 	runners := a.Runners()
 	m := a.machine()
 	cpus, memoryMB := hostSize(infos, m)
+	sentCPUs, sentMemoryMB := a.reportedSize(infos, m)
 	total, free := a.workDirSpace()
 	update, delivery := a.updateReport()
 	features := a.features()
@@ -1072,8 +1073,8 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		Features:          features,
 		Capacity:          a.opts.Capacity,
 		Version:           version.Version,
-		CPUs:              cpus,
-		MemoryMB:          memoryMB,
+		CPUs:              sentCPUs,
+		MemoryMB:          sentMemoryMB,
 		CPUMHz:            m.CPUMHz,
 		MemoryMTs:         m.MemoryMTs,
 		DiskKind:          m.DiskKind,
@@ -2402,6 +2403,19 @@ func (a *Agent) adoptExisting(ctx context.Context) {
 	if adopted > 0 {
 		a.log.Info("adopted runners already on this host", "runners", adopted)
 	}
+}
+
+// reportedSize is the size this host tells the controller it is. A host whose
+// backend runs each runner in a machine of its own reports no cores or memory:
+// the controller keeps a host at the capacity its size recommends unless an
+// operator has turned that off, and a Mac's cores and memory recommend far more
+// runners than its VM limit allows. The controller never resizes a host that
+// has not said how big it is, and it keeps a size it was told before.
+func (a *Agent) reportedSize(infos []backend.Info, m machine.Facts) (cpus int, memoryMB int64) {
+	if a.opts.Backends.SlotSized() {
+		return 0, 0
+	}
+	return hostSize(infos, m)
 }
 
 // hostSize is how much machine this host has for runners, preferring what a

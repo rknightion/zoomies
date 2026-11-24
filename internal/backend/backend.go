@@ -688,6 +688,27 @@ func (r *Registry) ProbeStale() bool {
 	return stale
 }
 
+// SlotSized is implemented by a backend that runs each runner in a machine of
+// its own, sized by the backend's settings rather than shared out of the host.
+// There, the host's cores and memory do not say how many runners fit.
+type SlotSized interface {
+	SlotSized() bool
+}
+
+// SlotSized reports whether any backend runs each runner in a machine of its
+// own size.
+func (r *Registry) SlotSized() bool {
+	if r == nil {
+		return false
+	}
+	for _, b := range r.backends {
+		if s, ok := b.(SlotSized); ok && s.SlotSized() {
+			return true
+		}
+	}
+	return false
+}
+
 // Kinds returns the registered backend kinds.
 func (r *Registry) Kinds() []store.BackendKind {
 	out := make([]store.BackendKind, 0, len(r.backends))

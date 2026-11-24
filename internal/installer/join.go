@@ -460,7 +460,7 @@ func Join(ctx context.Context, opts JoinOptions) error {
 		u.note("to match it, install that version and restart the agent:")
 		u.note("  curl -fsSL https://zoomies.sh/install.sh | sh -s -- --no-init --version <tag>")
 	}
-	if rep.CPUs == 0 {
+	if rep.CPUs == 0 && !isolation.usesVMPal() {
 		u.blank()
 		u.warn("this agent reported no CPUs, memory or disk, so the fleet cannot fit a pool's " +
 			"resource limits against this host.")
@@ -478,14 +478,18 @@ func reportedSize(r agent.Reported) string {
 	if r.CPUs <= 0 && r.MemoryMB <= 0 && r.DiskTotalMB <= 0 {
 		return "not reported by this agent"
 	}
-	out := fmt.Sprintf("%d vCPU", r.CPUs)
+	// A host that runs each job in a VM of its own reports its disk alone.
+	var parts []string
+	if r.CPUs > 0 {
+		parts = append(parts, fmt.Sprintf("%d vCPU", r.CPUs))
+	}
 	if r.MemoryMB > 0 {
-		out += fmt.Sprintf(" - %d GB", r.MemoryMB/1024)
+		parts = append(parts, fmt.Sprintf("%d GB", r.MemoryMB/1024))
 	}
 	if r.DiskTotalMB > 0 {
-		out += fmt.Sprintf(" - %d GB free of %d", r.DiskFreeMB/1024, r.DiskTotalMB/1024)
+		parts = append(parts, fmt.Sprintf("%d GB free of %d", r.DiskFreeMB/1024, r.DiskTotalMB/1024))
 	}
-	return out
+	return strings.Join(parts, " - ")
 }
 
 // confirmRejoin stops a second join from silently replacing an identity this
