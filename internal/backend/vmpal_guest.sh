@@ -224,8 +224,10 @@ cmd_run() {
 	# A background job of a shell without job control starts with SIGINT ignored,
 	# and a script cannot trap what was ignored when it started, so the stop below
 	# would never reach the runner. Perl puts the default back and becomes run.sh.
+	# The helper's umask is for its own files: under it, a checkout writes a
+	# tracked 0755 script as 0700. The subshell execs, so $! is still the runner.
 	# shellcheck disable=SC2016 # the program is Perl, and its variables are Perl's
-	ACTIONS_RUNNER_INPUT_JITCONFIG=$jit "$PERL" -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec { $ARGV[0] } @ARGV or exit 127' ./run.sh &
+	(umask 022 && ACTIONS_RUNNER_INPUT_JITCONFIG=$jit exec "$PERL" -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec { $ARGV[0] } @ARGV or exit 127' ./run.sh) &
 	child=$!
 	unset jit
 	trap 'kill -INT "$child" 2>/dev/null' INT

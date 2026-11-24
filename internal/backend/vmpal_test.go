@@ -1702,6 +1702,39 @@ exit 0`)
 	}
 }
 
+// The helper keeps its own files private, but a job is not one of them: a
+// checkout under umask 077 writes a tracked 0755 script as 0700, which broke a
+// packaging check that requires the tracked mode. The runner gets the umask a
+// signed-in shell would give it.
+func TestTheHelperStartsTheRunnerWithAnOrdinaryUmask(t *testing.T) {
+	g := newGuestRig(t)
+	out, err := g.run([]string{"ACTIONS_RUNNER_INPUT_JITCONFIG=" + vmpalTestJIT}, "deliver")
+	if err != nil || checkVMPalLine(out, vmpalDeliverOK) != nil {
+		t.Fatalf("deliver: %q, %v", out, err)
+	}
+	g.runner(`umask > "$HOME/seen-umask"
+: > "$HOME/made-by-job"
+exit 0`)
+	if out, err := g.run(nil, "run"); err != nil {
+		t.Fatalf("run: %q, %v", out, err)
+	}
+	got, err := os.ReadFile(filepath.Join(g.home, "seen-umask"))
+	if err != nil || strings.TrimSpace(string(got)) != "0022" {
+		t.Errorf("the runner started with umask %q, %v; want 0022", got, err)
+	}
+	info, err := os.Stat(filepath.Join(g.home, "made-by-job"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Errorf("a file the job made has mode %o, want 644", info.Mode().Perm())
+	}
+	// The exit record is the helper's again, written after the runner.
+	if info, err := os.Stat(g.path("exit")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("the exit record: %v, %v; want mode 600", info, err)
+	}
+}
+
 func TestTheHelperRecordsWhetherARunnerTookAJob(t *testing.T) {
 	for _, tc := range []struct {
 		name string
