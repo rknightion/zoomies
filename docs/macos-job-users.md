@@ -128,6 +128,31 @@ counts a page two of them share twice. CPU is the figure `ps` gives, which macOS
 smooths over the process's recent past, so it lags a sudden change. Memory has no
 limit to compare against, so only the use is shown.
 
+## What a Mac reports
+
+The host itself reports its usage as a Linux host does, so its card, its history
+and the problems that read them have figures to work from: CPU busy, the
+one-minute load average and the memory available. The agent has no cgo, so each
+comes from the nearest thing it can reach:
+
+| Figure | Where it comes from |
+| --- | --- |
+| Load average | The `vm.loadavg` sysctl, as the kernel keeps it. |
+| Memory available | The kernel's page counters: free pages plus the file-backed and purgeable ones, which macOS gives back under pressure. It is the same idea as Linux's `MemAvailable`, and far above the "free" a Mac shows, which macOS keeps near zero on purpose. |
+| CPU busy | The stock `/usr/bin/top`, run in the background for two samples five seconds apart, at most once in ten seconds. macOS keeps its per-CPU tick counters behind an interface a static binary cannot call and has no sysctl for them, so there is nothing cheaper to read. The figure is the busy share over that five-second window, not an average over the heartbeat, so it moves faster than a Linux host's. |
+| I/O wait and steal | Not reported. macOS has neither counter, so the host card shows them as absent, which is not the same as zero. |
+
+The first heartbeat after the agent starts has no CPU figure, because the first
+`top` run has not finished; the next has. A figure is reported only while the
+CPU count and memory the agent was given are this Mac's, so a Mac whose Docker
+runs in a smaller virtual machine reports nothing rather than the wrong
+machine. If `top` cannot run, CPU is absent and the other two still report.
+
+The controller reads these figures as it reads any host's: memory admission,
+the throttle and the problems that look at pressure all apply to a Mac now.
+Switch `scheduler.host_throttling` off if you do not want a Mac's slots reduced
+by what it measures. The memory valve (elastic memory) still needs Linux.
+
 ## Checking it works
 
 Run a probe workflow on the host's label that runs two jobs one after the other.

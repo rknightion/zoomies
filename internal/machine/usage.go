@@ -11,8 +11,8 @@ import (
 )
 
 // Usage describes the whole machine, including work not owned by Zoomies.
-// A missing value means unmeasured, never idle. Linux procfs is the only
-// source for now; other platforms retain reservation-based placement.
+// A missing value means unmeasured, never idle. Linux procfs and a Mac's
+// sysctls are the sources; other platforms retain reservation-based placement.
 type Usage struct {
 	CPUPercent        *float64
 	MemoryAvailableMB *int64
@@ -50,11 +50,21 @@ type UsageSampler struct {
 	iowait      uint64
 	steal       uint64
 	cpus        int
+	// mac is what a Mac reads in place of procfs. It is set on first use on
+	// darwin and never elsewhere, so a Linux sampler is untouched by it; a test
+	// sets it to exercise the Mac arithmetic on Linux.
+	mac *macSource
 }
 
 func (s *UsageSampler) Sample(cpus int, memoryMB int64) Usage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.mac == nil {
+		s.mac = defaultMacSource()
+	}
+	if s.mac != nil {
+		return s.mac.sample(cpus, memoryMB)
+	}
 	var out Usage
 	stat, err := os.ReadFile(filepath.Join(s.root, "/proc/stat"))
 	if err == nil {

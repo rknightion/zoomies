@@ -1436,9 +1436,9 @@ on the host says all of this in one sentence, what was taken, which
 measurement did it, what the running jobs are getting, and how it ends.
 
 Not every host can be throttled, because not every host is measured.
-Throttling needs a Linux agent on the machine it measures (the same hosts the
-sampling above covers) so a remote Docker endpoint, which is never sampled, is
-never throttled. Lowering a quota needs a Docker or Podman daemon beside that
+Throttling needs an agent on the machine it measures, Linux or a Mac (the same
+hosts the sampling below covers), so a remote Docker endpoint, which is never
+sampled, is never throttled. Lowering a quota needs a Docker or Podman daemon beside that
 agent: a host that offers only the `process` backend has no container to
 update, so its throttle is slots only, and its reason says so.
 
@@ -1472,9 +1472,10 @@ first rung and stays there; and one of capacity 1 keeps its slot on every rung,
 where the throttle is the CPU quota and nothing else.
 
 Whole-host sampling currently covers local Linux hosts whose procfs CPU and
-memory totals match the reported machine. Remote Docker endpoints, other
-operating systems and differing cgroup views retain reservation-based
-placement. Samples are best-effort observations, not predictions of a job's
+memory totals match the reported machine, and local Macs whose CPU count and
+memory match it (see [what a Mac reports](macos-job-users.md#what-a-mac-reports)).
+Remote Docker endpoints, other operating systems and differing cgroup views
+retain reservation-based placement. Samples are best-effort observations, not predictions of a job's
 peak memory demand. Continue setting appropriate pool limits and host reserves.
 The [host usage metrics](metrics.md) expose fresh measurements and admission
 holds for monitoring; diagnostic bundles include the same host view.

@@ -34,7 +34,7 @@ Two things are deliberately **not** here, and both were close calls, see
 | `github.com/charmbracelet/x/ansi` | Clip and measure terminal text by display cells, preserving colour escapes and wide characters when a window is resized. Already required by Bubble Tea; using it directly adds no module to the dependency graph. |
 | `github.com/charmbracelet/lipgloss` | Styling and responsive card layouts for the CLI home, plus the installer and table output. |
 | `golang.org/x/term` | Terminal detection, so the CLI and installer degrade to plain output when piped. |
-| `golang.org/x/sys` | The Windows half of the agent: the service control dispatcher a process started by the service manager must answer, the job object that lets killing a runner kill what it started, and the process and disk queries POSIX answers with a signal and a `statfs`. It was already in the tree as a transitive dependency; making it direct added no module. |
+| `golang.org/x/sys` | The Windows half of the agent: the service control dispatcher a process started by the service manager must answer, the job object that lets killing a runner kill what it started, and the process and disk queries POSIX answers with a signal and a `statfs`. On a Mac, `unix.SysctlRaw` reads the load average and the memory page counters the host usage figures need, which a static binary has no other way to ask the kernel for. It was already in the tree as a transitive dependency; making it direct added no module. |
 
 Standard library for everything else: `net/http`, `log/slog`, `database/sql`,
 `crypto/*`, `embed`, `os/exec`, `context`, `testing`.
