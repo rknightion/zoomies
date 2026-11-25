@@ -41,7 +41,7 @@ func TestJobUserEnvIsBuiltFromNothingWithThePoolsOwnSettingsLast(t *testing.T) {
 	s := &jobUserSlot{n: 3, name: "zj03", uid: 653}
 	spec := Spec{Name: "runner-a", Ephemeral: true, Credentials: Credentials{JITConfig: "jit-secret"},
 		Env: map[string]string{"LANG": "C", "EXTRA": "1"}}
-	env := jobUserEnv(s, "/Users/zj03", "/var/folders/ab/cd/T/", spec)
+	env := jobUserEnv(s, "/Users/zj03", "/var/folders/ab/cd/T/", "", spec)
 	got := envMap(env)
 
 	for k, v := range map[string]string{

@@ -80,8 +80,9 @@ Other differences from a VM clone:
 * **No GUI session.** Job accounts never log in, so simulator and UI tests do not
   work. Builds, `swift build`, `codesign` and keychain work do.
 * **Empty home every job.** SwiftPM packages, DerivedData and setup actions' tool
-  caches are fetched again each time. Xcode, the Command Line Tools, Homebrew and
-  its formulae, and the runner are shared and stay.
+  caches are fetched again each time, unless the pool keeps [a cache folder](#a-cache-that-survives-the-reset)
+  outside the home. Xcode, the Command Line Tools, Homebrew and its formulae, and
+  the runner are shared and stay.
 * **No `brew install` in a job.** Homebrew belongs to the admin account. Use setup
   actions, or install into the job's own home.
 * **Ephemeral pools only.** A pool that is not ephemeral is refused, and so is a
@@ -153,6 +154,61 @@ the throttle and the problems that look at pressure all apply to a Mac now.
 Switch `scheduler.host_throttling` off if you do not want a Mac's slots reduced
 by what it measures. The memory valve (elastic memory) still needs Linux.
 
+## A cache that survives the reset
+
+Wiping the home means a Swift job fetches and resolves its packages and compiles
+everything from nothing each time. Turn the pool's cache on (`cache.enabled`) and
+each account gets one folder that the reset leaves alone. The job is told where it
+is in `ZOOMIES_CACHE_DIR`, and a workflow uses it by pointing its build there:
+
+```yaml
+- run: swift build --scratch-path "$ZOOMIES_CACHE_DIR/$TRUST/$VARIANT/$HASH"
+```
+
+Nothing else moves. `XDG_CACHE_HOME` and every tool's own cache stay in the home
+and are wiped as before, so a workflow opts in by using the folder and no tool
+shares anything it was not told to. With the pool's cache off, nothing changes: no
+folder is made and the variable is not set.
+
+* **Where.** `/Users/.zoomies-cache/zjNN`, owned by that account and closed to
+  every other (mode 0700), beside the trash and on the same volume as the homes.
+  It is outside the home, and outside every folder the reset sweeps for files the
+  account owns (`/private/tmp`, `/private/var/tmp`, `/Library/Caches` and
+  `/Users/Shared`), so the reset neither moves nor deletes it. It still fails
+  on anything else the account left behind. Before each job the agent gives the
+  folder back to the account and closes it again, in case the last job opened it.
+* **One folder for each account, not one for the host.** A folder with one owner
+  keeps what the reset is for: one job user can never write another's files. The
+  price is that a job finds only what an earlier job on the same account saved, so
+  with several accounts the cache warms up once for each.
+* **Size.** Each account's folder is kept under the pool's cache size limit, or
+  10 GiB where the pool sets none, so the most a host uses is that figure times
+  the number of accounts. The agent prunes just before a job starts and never
+  while a job is running in the account. It deletes whole entries, the one
+  written to longest ago first, where an entry is what is directly inside the
+  folder and its age is the latest write to anything in it. If what is left is
+  one folder and it is still over, it weighs the entries inside that folder the
+  same way. So put each scratch folder in a folder of its own, and a recent one is
+  kept while a stale one goes. It is a ceiling on how far over a folder is when a
+  job starts, not a quota: a single job can still fill the disk. The pool settings
+  accept a size limit only with an absolute cache `source`, which this mode does
+  not use for the folder; give it any absolute path.
+* **A cache is only an accelerator.** If the agent cannot make or prune the folder
+  it says so in its log, runs the job without `ZOOMIES_CACHE_DIR` and the job
+  carries on. A workflow that needs the folder should check the variable is set.
+* **Rolling back.** `job-users remove` deletes the cache folders with the
+  accounts.
+
+**The trust trade-off.** The folder lasts across every job that lands on that
+account, whatever its trust level: a pull request from a branch and a build of
+`main` can run one after the other as the same account. A job can write anything
+to the folder, so a later job that reads it trusts what an earlier one left. A
+workflow that cares must put the trust level in the path itself, with a name for
+`main` and a separate one for each pull request or run (as in `$TRUST` above),
+and read only the folder for its own level. The agent cannot do that for it, as it
+does not know what the workflow keeps there. This is one more reason this mode is
+for repositories you trust.
+
 ## Checking it works
 
 Run a probe workflow on the host's label that runs two jobs one after the other.
@@ -181,7 +237,8 @@ sudo zoomies agent job-users remove
 ```
 
 `job-users remove` refuses while the LaunchDaemon is loaded. It stops everything the
-accounts run and deletes the accounts, their homes, the trash and the group. It
+accounts run and deletes the accounts, their homes, the trash, the cache folders
+and the group. It
 refuses if any account or group in its range is not one Zoomies made.
 
 ## Updating the agent

@@ -36,8 +36,9 @@ func checkJobUserEnv(spec Spec) error {
 // with launchd's minimal one, so everything the runner needs is written here and
 // nothing is inherited: a job must not read what the agent was started with.
 // There is no RUNNER_ALLOW_RUNASROOT, because the runner is never root. The
-// pool's own settings come last and win.
-func jobUserEnv(s *jobUserSlot, home, tmpDir string, spec Spec) []string {
+// pool's own settings come last and win. cacheDir is the slot's persistent cache
+// folder, which is empty, and is then not mentioned, when the pool keeps no cache.
+func jobUserEnv(s *jobUserSlot, home, tmpDir, cacheDir string, spec Spec) []string {
 	env := []string{
 		"HOME=" + home,
 		"USER=" + s.name,
@@ -52,6 +53,9 @@ func jobUserEnv(s *jobUserSlot, home, tmpDir string, spec Spec) []string {
 	}
 	if tmpDir != "" {
 		env = append(env, "TMPDIR="+tmpDir)
+	}
+	if cacheDir != "" {
+		env = append(env, EnvCacheDir+"="+cacheDir)
 	}
 	keys := make([]string, 0, len(spec.Env))
 	for k := range spec.Env {

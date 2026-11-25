@@ -89,6 +89,9 @@ func (u *jobUsers) removeAll(ctx context.Context) error {
 	if err := u.sys.RemoveAll(u.trashDir); err != nil {
 		return fmt.Errorf("removing the trash folder %s: %w", u.trashDir, err)
 	}
+	if err := u.removeCacheFolders(ctx); err != nil {
+		return fmt.Errorf("removing the cache folders in %s: %w", u.cacheRoot(), err)
+	}
 	if _, ok := groups[jobUserGroup]; ok {
 		if _, err := u.run(ctx, "/usr/bin/dscl", ".", "-delete", "/Groups/"+jobUserGroup); err != nil {
 			return fmt.Errorf("deleting the group %s: %w", jobUserGroup, err)

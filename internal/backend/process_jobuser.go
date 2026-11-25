@@ -292,7 +292,9 @@ func (b *ProcessBackend) createJobUser(ctx context.Context, spec Spec, started t
 
 	// The registration is in the environment only, as in the plain backend, and
 	// never touches disk.
-	env := jobUserEnv(slot, u.home(slot), tmp, spec)
+	// The pool's cache is made ready now, with the slot reserved and the job not
+	// started: the one moment it can be pruned.
+	env := jobUserEnv(slot, u.home(slot), tmp, u.prepareCache(ctx, slot, spec), spec)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return CreateResult{}, fmt.Errorf("backend: creating the runner record %s: %w", dir, err)
 	}
