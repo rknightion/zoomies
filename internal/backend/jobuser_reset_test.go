@@ -426,3 +426,13 @@ func TestTheCleanedTreesAreOneListThatHoldsLibraryCaches(t *testing.T) {
 		}
 	}
 }
+
+func TestResetTreatsAnAccountWithNoGuiDomainAsNothingToBootOut(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	// An account that has never logged in has no gui domain, and launchd says
+	// so with exit 125 rather than "no such process".
+	x.f.answerCode(125, "Boot-out failed: 125: Domain does not support specified action\n", "launchctl", "bootout", "gui/651")
+	if err := x.u.resetSlot(context.Background(), x.u.slotNamed("zj01")); err != nil {
+		t.Fatalf("a missing gui domain failed the reset: %v", err)
+	}
+}

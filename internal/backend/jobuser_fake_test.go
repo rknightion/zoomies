@@ -39,8 +39,11 @@ type fakeJobUsers struct {
 	procs   []jobUserProc
 	// stubborn keeps every process alive through pkill, so a reset has to give up.
 	stubborn bool
-	rules    []fakeRule
-	owners   map[string][2]int
+	// ignoreUID makes sysadminctl hand out the next free UID from 503 whatever
+	// -UID said, as it was seen to on a real Mac.
+	ignoreUID bool
+	rules     []fakeRule
+	owners    map[string][2]int
 	// lstat answers for paths that cannot exist on the machine the test runs on.
 	lstat   map[string]fs.FileInfo
 	ipcs    string
@@ -112,6 +115,14 @@ func (f *fakeJobUsers) answer(output string, prefix ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rules = append(f.rules, fakeRule{prefix: prefix, res: jobUserResult{Output: output}})
+}
+
+// answerCode is answer with an exit code, for a command that fails in a way the
+// code has to read.
+func (f *fakeJobUsers) answerCode(code int, output string, prefix ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rules = append(f.rules, fakeRule{prefix: prefix, res: jobUserResult{ExitCode: code, Output: output}})
 }
 
 func (f *fakeJobUsers) clear() {
@@ -252,6 +263,12 @@ func (f *fakeJobUsers) defaultRun(c jobUserCommand) jobUserResult {
 					sh = jobUserLoginShell
 				}
 				return jobUserResult{Output: "UserShell: " + sh + "\n"}
+			case "UniqueID":
+				uid, set := f.users[name]
+				if !set {
+					return jobUserResult{ExitCode: 56, Output: "eDSRecordNotFound"}
+				}
+				return jobUserResult{Output: fmt.Sprintf("UniqueID: %d\n", uid)}
 			case "NFSHomeDirectory":
 				home, set := f.homeOf[name]
 				if !set {
@@ -270,6 +287,9 @@ func (f *fakeJobUsers) defaultRun(c jobUserCommand) jobUserResult {
 		case arg(2) == "-create" && strings.HasPrefix(arg(3), "/Users/") && arg(4) == "PrimaryGroupID":
 			n, _ := strconv.Atoi(arg(5))
 			f.groupOf[strings.TrimPrefix(arg(3), "/Users/")] = n
+		case arg(2) == "-create" && strings.HasPrefix(arg(3), "/Users/") && arg(4) == "UniqueID":
+			n, _ := strconv.Atoi(arg(5))
+			f.users[strings.TrimPrefix(arg(3), "/Users/")] = n
 		case arg(2) == "-create" && strings.HasPrefix(arg(3), "/Users/") && arg(4) == "UserShell":
 			f.shellOf[strings.TrimPrefix(arg(3), "/Users/")] = arg(5)
 		case arg(2) == "-delete" && strings.HasPrefix(arg(3), "/Groups/"):
@@ -299,6 +319,9 @@ func (f *fakeJobUsers) defaultRun(c jobUserCommand) jobUserResult {
 		switch arg(1) {
 		case "-addUser":
 			uid, _ := strconv.Atoi(arg(4))
+			if f.ignoreUID {
+				uid = 503 + len(f.users)
+			}
 			f.users[arg(2)] = uid
 			f.groupOf[arg(2)] = 20
 			// sysadminctl's own default, unless it is told otherwise.

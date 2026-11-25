@@ -245,3 +245,18 @@ func TestJobUserRetryDelayIsAMinuteThenFiveThenFifteen(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureSlotsSetsTheUIDWhenSysadminctlIgnoresIt(t *testing.T) {
+	x := newJobUserFixture(t, 1)
+	// On a real Mac sysadminctl gave the next free UID from 503 and ignored
+	// -UID, which left the accounts outside the range the agent keys to.
+	x.f.ignoreUID = true
+	if err := x.u.ensureSlots(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int{"zj01": 651, "zj02": 652} {
+		if got := x.f.users[name]; got != want {
+			t.Errorf("%s has UID %d, want %d", name, got, want)
+		}
+	}
+}

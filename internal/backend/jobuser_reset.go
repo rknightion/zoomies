@@ -143,8 +143,9 @@ func (u *jobUsers) stopProcesses(ctx context.Context, s *jobUserSlot) error {
 // bootoutNoDomain is what launchctl says when the user has no such domain, which
 // is the usual case and not a failure. The exit codes are launchd's for "no
 // such process" and "input/output error", which it uses for a domain that is not
-// loaded.
-var bootoutNoDomain = regexp.MustCompile(`(?i)no such process|could not find|not found|input/output error|no such domain`)
+// loaded, and an account that has never logged in has no gui domain at all, which
+// launchd answers with "Domain does not support specified action" (exit 125).
+var bootoutNoDomain = regexp.MustCompile(`(?i)no such process|could not find|not found|input/output error|no such domain|does not support specified action`)
 
 func (u *jobUsers) bootoutDomains(ctx context.Context, s *jobUserSlot) error {
 	for _, domain := range []string{"user", "gui"} {

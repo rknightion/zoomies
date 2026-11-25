@@ -561,7 +561,11 @@ func (u *jobUsers) createAccount(ctx context.Context, s *jobUserSlot) error {
 		"-home", u.home(s), "-password", base64.StdEncoding.EncodeToString(raw)); err != nil {
 		return fmt.Errorf("creating the account %s: %w", s.name, err)
 	}
+	// sysadminctl on macOS 27.3 was seen to ignore -UID and hand out the next
+	// free one, which would leave the account outside the range everything else
+	// is keyed to. The UID is set again here and read back below.
 	for _, argv := range [][]string{
+		{"/usr/bin/dscl", ".", "-create", "/Users/" + s.name, "UniqueID", strconv.Itoa(s.uid)},
 		{"/usr/bin/dscl", ".", "-create", "/Users/" + s.name, "UserShell", jobUserLoginShell},
 		{"/usr/bin/dscl", ".", "-create", "/Users/" + s.name, "PrimaryGroupID", strconv.Itoa(jobUserGID)},
 		{"/usr/bin/dscl", ".", "-create", "/Users/" + s.name, "IsHidden", "1"},
@@ -572,6 +576,11 @@ func (u *jobUsers) createAccount(ctx context.Context, s *jobUserSlot) error {
 			_, _ = u.run(ctx, "/usr/sbin/sysadminctl", "-deleteUser", s.name)
 			return fmt.Errorf("setting up the account %s: %w", s.name, err)
 		}
+	}
+	got, err := u.run(ctx, "/usr/bin/dscl", ".", "-read", "/Users/"+s.name, "UniqueID")
+	if err != nil || strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(got), "UniqueID:")) != strconv.Itoa(s.uid) {
+		_, _ = u.run(ctx, "/usr/sbin/sysadminctl", "-deleteUser", s.name)
+		return fmt.Errorf("the account %s did not take UID %d (Directory Services says %q), so it was not kept", s.name, s.uid, strings.TrimSpace(got))
 	}
 	u.log.Info("made a job user", "slot", s.name, "uid", s.uid)
 	return nil
