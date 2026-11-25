@@ -479,3 +479,43 @@ func TestResetTreatsAnAccountWithNoGuiDomainAsNothingToBootOut(t *testing.T) {
 		t.Fatalf("a missing gui domain failed the reset: %v", err)
 	}
 }
+
+func TestResetSkipsFoldersTheSystemClosesEvenToRoot(t *testing.T) {
+	// Some folders in /Library/Caches belong to macOS and are closed even to
+	// root, so find complains about them and exits 1. A job cannot write there
+	// either; failing the reset on them took every job user out of service on a
+	// real Mac before its first job.
+	x := startedJobUserFixture(t, 1)
+	dir, err := os.Lstat(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.f.lstat["/Library/Caches"] = dir
+	closed := "find: /Library/Caches/com.apple.amsengagementd.classicdatavault: Operation not permitted\n"
+	x.f.answerCode(1, closed, "/usr/bin/find", "-x", "-P", "/Library/Caches", "-user", "651", "-delete")
+	x.f.answerCode(1, "/Library/Caches/left-by-the-job\n"+closed, "/usr/bin/find", "-x", "-P", "/Library/Caches", "-user", "651", "-print")
+	s := x.u.slotNamed("zj01")
+	if err := x.u.removeSharedFiles(context.Background(), s); err != nil {
+		t.Fatalf("a folder closed to root failed the reset: %v", err)
+	}
+	left, err := x.u.findOwned(context.Background(), "/Library/Caches", s.uid, "-print")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left != "/Library/Caches/left-by-the-job" {
+		t.Errorf("findOwned = %q; want only the job's file, without find's complaint", left)
+	}
+}
+
+func TestResetStillFailsWhenFindFailsForAnyOtherReason(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	dir, err := os.Lstat(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.f.lstat["/Library/Caches"] = dir
+	x.f.answerCode(1, "find: /Library/Caches/com.apple.x: Operation not permitted\nfind: /Library/Caches/build: Directory not empty\n", "/usr/bin/find", "-x", "-P", "/Library/Caches")
+	if err := x.u.removeSharedFiles(context.Background(), x.u.slotNamed("zj01")); err == nil {
+		t.Error("find failing to delete a job's folder was taken as a clean reset")
+	}
+}

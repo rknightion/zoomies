@@ -374,11 +374,44 @@ func (u *jobUsers) removeSharedFiles(ctx context.Context, s *jobUserSlot) error 
 			}
 			return err
 		}
-		if _, err := u.run(ctx, "/usr/bin/find", "-x", "-P", tree, "-user", strconv.Itoa(s.uid), "-delete"); err != nil {
+		if _, err := u.findOwned(ctx, tree, s.uid, "-delete"); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// findOwned runs find over one shared tree for what uid owns, with action
+// -delete or -print, and returns what it printed. Some folders in
+// /Library/Caches belong to macOS and are closed even to root, so find says
+// "Operation not permitted" for them and exits 1. A job cannot write there
+// either, so those lines are dropped and do not fail the reset; any other
+// complaint from find still does.
+func (u *jobUsers) findOwned(ctx context.Context, tree string, uid int, action string) (string, error) {
+	argv := []string{"/usr/bin/find", "-x", "-P", tree, "-user", strconv.Itoa(uid), action}
+	res, err := u.sys.Run(ctx, jobUserCommand{Argv: argv})
+	if err != nil {
+		return "", err
+	}
+	var found []string
+	closed := false
+	for _, line := range strings.Split(res.Output, "\n") {
+		if line == "" {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(line, "find: "); ok {
+			if strings.HasSuffix(rest, ": Operation not permitted") {
+				closed = true
+				continue
+			}
+			return res.Output, fmt.Errorf("find in %s exited %d: %s", tree, res.ExitCode, strings.TrimSpace(res.Output))
+		}
+		found = append(found, line)
+	}
+	if res.ExitCode != 0 && !closed {
+		return res.Output, fmt.Errorf("find in %s exited %d: %s", tree, res.ExitCode, strings.TrimSpace(res.Output))
+	}
+	return strings.Join(found, "\n"), nil
 }
 
 // ipcObject is one System V object ipcs listed.
@@ -442,7 +475,7 @@ func (u *jobUsers) verifyReset(ctx context.Context, s *jobUserSlot) error {
 		if _, err := u.sys.Lstat(tree); err != nil {
 			continue
 		}
-		out, err := u.run(ctx, "/usr/bin/find", "-x", "-P", tree, "-user", strconv.Itoa(s.uid), "-print")
+		out, err := u.findOwned(ctx, tree, s.uid, "-print")
 		if err != nil {
 			return err
 		}
