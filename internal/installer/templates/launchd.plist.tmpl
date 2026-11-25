@@ -36,6 +36,10 @@
 		<key>PATH</key>
 		<string>{{xml .Path}}</string>
 {{- end}}
+{{- range .Env}}
+		<key>{{xml .Name}}</key>
+		<string>{{xml .Value}}</string>
+{{- end}}
 	</dict>
 </dict>
 </plist>

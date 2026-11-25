@@ -830,13 +830,36 @@ type Agent struct {
 	ProcessIsolation string `yaml:"process_isolation"`
 	// VMPal configures the macOS VM backend that ProcessIsolation "vmpal" selects.
 	VMPal VMPalConfig `yaml:"vmpal"`
+	// JobUsers configures the macOS job-user mode that ProcessIsolation "user"
+	// selects.
+	JobUsers JobUsersConfig `yaml:"job_users"`
 }
 
 // The values of agent.process_isolation.
 const (
 	ProcessIsolationNone  = "none"
 	ProcessIsolationVMPal = "vmpal"
+	// ProcessIsolationUser runs each job on a Mac as a local account of its own,
+	// whose home is wiped afterwards. It is weaker than a VM and says so in
+	// docs/macos-job-users.md.
+	ProcessIsolationUser = "user"
 )
+
+// MaxJobUsersCapacity is the most jobs a host in user mode runs at once. The
+// host has one more account than that, and the accounts' UIDs are fixed in a
+// range of 48.
+const MaxJobUsersCapacity = 47
+
+// JobUsersConfig is what user isolation needs beyond agent.capacity, which is
+// how many jobs run at once. There is no default for either list: a check with
+// nothing to test would pass.
+type JobUsersConfig struct {
+	// EgressMustAllow and EgressMustBlock are the host:port targets a job user's
+	// network is checked against before every job. The blocked ones are IPv4
+	// literals, so that a resolver cannot make the check pass.
+	EgressMustAllow []string `yaml:"egress_must_allow"`
+	EgressMustBlock []string `yaml:"egress_must_block"`
+}
 
 // DefaultVMPalBinary is where VMPal installs its command.
 const DefaultVMPalBinary = "/usr/local/bin/vmpal"
@@ -895,6 +918,34 @@ func LoadVMPalFile(path string) (VMPalConfig, error) {
 		return VMPalConfig{}, fmt.Errorf("%s holds more than one YAML document; keep only the agent.vmpal settings", path)
 	}
 	return doc.Agent.VMPal, nil
+}
+
+// LoadJobUsersFile reads the file `zoomies agent join --job-users-config` is
+// given, strictly and for the same reason LoadVMPalFile is: the join spends a
+// single-use token on what the file says, so a misspelt key stops it here.
+func LoadJobUsersFile(path string) (JobUsersConfig, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return JobUsersConfig{}, fmt.Errorf("reading the job-user settings: %w", err)
+	}
+	var doc struct {
+		Agent struct {
+			JobUsers JobUsersConfig `yaml:"job_users"`
+		} `yaml:"agent"`
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&doc); err != nil {
+		if errors.Is(err, io.EOF) {
+			return JobUsersConfig{}, fmt.Errorf("%s is empty; it needs an agent.job_users section", path)
+		}
+		return JobUsersConfig{}, fmt.Errorf("%s: %w; it may hold only agent.job_users settings", path, err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return JobUsersConfig{}, fmt.Errorf("%s holds more than one YAML document; keep only the agent.job_users settings", path)
+	}
+	return doc.Agent.JobUsers, nil
 }
 
 // MinRegistryMirrorBytes is the smallest size a registry mirror may be given

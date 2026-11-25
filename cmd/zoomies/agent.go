@@ -34,6 +34,14 @@ func runAgent(ctx context.Context, e *env, args []string) error {
 	if len(args) > 0 && args[0] == "install" {
 		return runAgentInstall(ctx, e, args[1:])
 	}
+	// Neither is listed: the first is run by the agent itself as a job user, and
+	// the second is for an operator retiring job-user isolation on a Mac.
+	if len(args) > 0 && args[0] == "egress-probe" {
+		return runAgentEgressProbe(ctx, e, args[1:])
+	}
+	if len(args) > 0 && args[0] == "job-users" {
+		return runAgentJobUsers(ctx, e, args[1:])
+	}
 	return runAgentDaemon(ctx, e, args)
 }
 
@@ -252,13 +260,15 @@ func runAgentJoin(ctx context.Context, e *env, args []string) error {
 	nonInteractive := fs.Bool("non-interactive", false, "never prompt; a missing answer is an error naming it")
 	assumeYes := fs.Bool("yes", false, "answer yes to the one question a re-join asks; it does not answer the update helper's")
 	updateHelper := fs.Bool("update-helper", false, "add the update helper without asking, so that the web UI can update this host")
-	processIsolation := fs.String("process-isolation", "", "what keeps a job off this machine: vmpal runs each runner in a throwaway macOS VM, none runs it directly on the host (a Mac must say which)")
+	processIsolation := fs.String("process-isolation", "", "what keeps a job off this machine: vmpal runs each runner in a throwaway macOS VM, user runs each job as a local account of its own on a Mac (as root), none runs it directly on the host (a Mac must say which)")
 	vmpalConfig := fs.String("vmpal-config", "", "YAML file holding the agent.vmpal settings, read and checked before the token is spent (needed with --process-isolation vmpal)")
+	jobUsersConfig := fs.String("job-users-config", "", "YAML file holding the agent.job_users settings, read and checked before the token is spent (needed with --process-isolation user)")
 	fs.example(
 		"zoomies agent join https://zoomies.example.com --token zoojoin_...",
 		"zoomies agent join https://zoomies.example.com --token zoojoin_... --capacity 8 --labels arch=arm64",
 		"zoomies agent join https://zoomies.internal --token zoojoin_... --ca-file /etc/zoomies/controller.crt",
 		"zoomies agent join https://zoomies.example.com --token zoojoin_... --process-isolation vmpal --vmpal-config vmpal.yaml",
+		"sudo zoomies agent join https://zoomies.example.com --token zoojoin_... --process-isolation user --job-users-config job-users.yaml",
 	)
 	if err := fs.parse(args); err != nil {
 		return err
@@ -303,6 +313,7 @@ func runAgentJoin(ctx context.Context, e *env, args []string) error {
 		UpdateHelper:       *updateHelper,
 		ProcessIsolation:   *processIsolation,
 		VMPalConfigFile:    *vmpalConfig,
+		JobUsersConfigFile: *jobUsersConfig,
 		Interactive:        interactive,
 		Out:                e.out,
 		In:                 e.in,

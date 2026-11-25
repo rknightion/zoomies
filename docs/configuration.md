@@ -439,7 +439,7 @@ settings page reports rather than refusing the edit.
 | `agent.runner_download_url` | `ZOOMIES_AGENT_RUNNER_DOWNLOAD_URL` | next restart | Runner download mirror: Where the process backend fetches runner archives from, for hosts that mirror releases internally. The path below it is the same. |
 | `agent.runner_sha256` | `ZOOMIES_AGENT_RUNNER_SHA256` | next restart | Runner archive digest: The expected digest of the actions/runner archive the process backend downloads. Zoomies ships the digest for the release it pins; supply one when you pin another. |
 | `agent.work_dir` | `ZOOMIES_WORK_DIR` | next restart | Working directory: Where runner working directories and the agent's own credentials live. |
-| `agent.process_isolation` | `ZOOMIES_AGENT_PROCESS_ISOLATION` | on the agent's own host | Process isolation: What keeps a process-backend job off this machine: vmpal runs each runner in a throwaway macOS VM, none runs it directly on the host. A remote agent on a Mac must have this in its config file. |
+| `agent.process_isolation` | `ZOOMIES_AGENT_PROCESS_ISOLATION` | on the agent's own host | Process isolation: What keeps a process-backend job off this machine: vmpal runs each runner in a throwaway macOS VM, user runs each job as a local account of its own on a Mac with its home wiped afterwards, none runs it directly on the host. A remote agent on a Mac must have this in its config file. |
 | `agent.vmpal.binary` | `ZOOMIES_AGENT_VMPAL_BINARY` | on the agent's own host | VMPal command: The absolute path of the vmpal command. |
 | `agent.vmpal.template` | `ZOOMIES_AGENT_VMPAL_TEMPLATE` | on the agent's own host | VMPal template: The shut-down macOS VM every runner is cloned from. Required with vmpal isolation. |
 | `agent.vmpal.max_vms` | `ZOOMIES_AGENT_VMPAL_MAX_VMS` | on the agent's own host | VMPal runners at once: How many VM runners this Mac may hold at once: 1 or 2, because Apple allows two macOS VMs on one Mac. |
@@ -449,6 +449,8 @@ settings page reports rather than refusing the edit.
 | `agent.vmpal.policy_check` | `ZOOMIES_AGENT_VMPAL_POLICY_CHECK` | on the agent's own host | VMPal policy check: The absolute path of the command that attests this Mac's firewall policy. Required with vmpal isolation. |
 | `agent.vmpal.egress_must_allow` | `ZOOMIES_AGENT_VMPAL_EGRESS_MUST_ALLOW` | on the agent's own host | VMPal egress that must work: The host:port targets a clone must reach before it is given a credential. Required with vmpal isolation. |
 | `agent.vmpal.egress_must_block` | `ZOOMIES_AGENT_VMPAL_EGRESS_MUST_BLOCK` | on the agent's own host | VMPal egress that must fail: The IP-literal host:port targets a clone must not reach before it is given a credential. Required with vmpal isolation. |
+| `agent.job_users.egress_must_allow` | `ZOOMIES_AGENT_JOB_USERS_EGRESS_MUST_ALLOW` | on the agent's own host | Job users egress that must work: The host:port targets a job user must reach before each job. Required with user isolation. |
+| `agent.job_users.egress_must_block` | `ZOOMIES_AGENT_JOB_USERS_EGRESS_MUST_BLOCK` | on the agent's own host | Job users egress that must fail: The IPv4-literal host:port targets a job user must not reach before each job. Required with user isolation. |
 
 ### `assistant`
 

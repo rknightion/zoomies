@@ -75,6 +75,9 @@ type JoinOptions struct {
 	ProcessIsolation string
 	// VMPalConfigFile holds the agent.vmpal settings, for "vmpal" and only then.
 	VMPalConfigFile string
+	// JobUsersConfigFile holds the agent.job_users settings, for "user" and only
+	// then.
+	JobUsersConfigFile string
 	// Interactive is whether a person is at a terminal to answer a question that
 	// defaults to no. NonInteractive alone cannot say it: a join run with neither
 	// flag and no terminal would otherwise read an answer off whatever its input
@@ -97,7 +100,16 @@ type JoinOptions struct {
 	// reports itself available on a Mac with a working network policy check, and
 	// a test has neither.
 	vmpalRegistry func(backend.VMPalOptions) (*backend.Registry, error)
+	// jobUserBinaryCheck stands in for CheckJobUserBinary, which a test's binary
+	// could never pass: it is not root's, in a folder only root can change.
+	jobUserBinaryCheck func(binary string) error
 }
+
+// JobUsersSupportDir is where a job-user agent keeps its configuration, state
+// and work folder. It is root's, and nothing in the user's home: the agent runs
+// as root, and a root process whose HOME is /var/root would otherwise look
+// somewhere else on every start.
+const JobUsersSupportDir = "/Library/Application Support/zoomies"
 
 func (o JoinOptions) configDir() string {
 	if o.ConfigDir != "" {
@@ -128,6 +140,14 @@ func Join(ctx context.Context, opts JoinOptions) error {
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
+	}
+	if opts.ProcessIsolation == config.ProcessIsolationUser {
+		if opts.ConfigDir == "" {
+			opts.ConfigDir = JobUsersSupportDir
+		}
+		if opts.StateDir == "" {
+			opts.StateDir = JobUsersSupportDir
+		}
 	}
 	log := opts.Logger.With("component", "installer.join")
 	u := newUI(opts.Out)
@@ -171,6 +191,22 @@ func Join(ctx context.Context, opts JoinOptions) error {
 	if err != nil {
 		return err
 	}
+	if isolation.usesUser() {
+		check := opts.jobUserBinaryCheck
+		if check == nil {
+			check = CheckJobUserBinary
+		}
+		if err := check(det.BinaryPath); err != nil {
+			return fmt.Errorf("installer: %w. Fix that and run this again; nothing has been redeemed", err)
+		}
+		// Added when the operator did not say, so that a pool's host selector can
+		// find these hosts and none of the VM hosts.
+		labels := map[string]string{"isolation": "user"}
+		for k, v := range opts.Labels {
+			labels[k] = v
+		}
+		opts.Labels = labels
+	}
 
 	// Decided before anything is written or redeemed. The join token is single
 	// use, and the unit goes to /etc/systemd/system, which a user without root
@@ -204,14 +240,30 @@ func Join(ctx context.Context, opts JoinOptions) error {
 		// decideJoinIsolation has refused any other figure that was asked for.
 		capacity = isolation.vmpal.MaxVMs
 	}
+	if isolation.usesUser() && opts.Capacity <= 0 {
+		// Four is what the design runs, and half the cores of a big Mac would
+		// not be a deliberate choice of how many jobs may share it.
+		capacity = min(capacity, config.MaxJobUsersCapacity)
+	}
 	serviceUser, serviceGroup := opts.ServiceUser, opts.ServiceUser
 	if serviceUser == "" {
 		serviceUser, serviceGroup = defaultServiceUser(det)
 	}
+	var serviceEnv []ServiceEnv
+	if isolation.usesUser() {
+		// A LaunchDaemon starts with launchd's minimal environment and root's
+		// HOME, so the folders are named outright, and every other root process
+		// on this Mac keeps looking where it did.
+		serviceUser, serviceGroup = "root", "wheel"
+		serviceEnv = []ServiceEnv{
+			{Name: "ZOOMIES_CONFIG_DIR", Value: opts.configDir()},
+			{Name: "ZOOMIES_STATE_DIR", Value: opts.stateDir()},
+		}
+	}
 
 	// --- Directories and the service account ---------------------------
 	u.step("Service user and directories")
-	if det.Root && det.OS != "darwin" {
+	if det.Root && det.OS != "darwin" && !isolation.usesUser() {
 		created, err := ensureServiceUser(ctx, serviceUser, serviceGroup, opts.stateDir())
 		if err != nil {
 			return err
@@ -222,6 +274,16 @@ func Join(ctx context.Context, opts JoinOptions) error {
 	}
 	if err := prepareDirs(ctx, runtime.GOOS, runCommand, opts.configDir(), opts.stateDir(), workDir); err != nil {
 		return err
+	}
+	if isolation.usesUser() {
+		// Closed to everybody but root before anything is written into them: the
+		// jobs run on this Mac as other accounts, and the agent's credentials
+		// must be out of their reach.
+		for _, dir := range []string{opts.configDir(), opts.stateDir(), workDir} {
+			if err := os.Chmod(dir, 0o700); err != nil {
+				return fmt.Errorf("installer: closing %s to everybody but root: %w", dir, err)
+			}
+		}
 	}
 	u.ok(opts.configDir() + " and " + opts.stateDir() + " are ready")
 
@@ -243,6 +305,15 @@ func Join(ctx context.Context, opts JoinOptions) error {
 		}
 		defer registry.Close()
 		chosen = store.BackendProcess
+	} else if isolation.usesUser() {
+		// The probe is of the plain backend: the job users are made by the agent
+		// when it starts, and making accounts is not something a join does while
+		// it still holds an unspent token.
+		proc, err := backend.NewProcess(backend.ProcessOptions{WorkDir: workDir, Logger: opts.Logger})
+		if err != nil {
+			return fmt.Errorf("installer: the process backend cannot start, and nothing has been redeemed: %w", err)
+		}
+		registry, chosen = backend.NewRegistry(proc), store.BackendProcess
 	} else {
 		registry, chosen, err = buildRegistry(ctx, det, opts, workDir)
 		if err != nil {
@@ -262,6 +333,8 @@ func Join(ctx context.Context, opts JoinOptions) error {
 			return err
 		}
 		u.ok("this host will run each job in its own macOS VM")
+	} else if isolation.usesUser() {
+		u.ok("this host will run each job as its own job user, with its home wiped afterwards")
 	} else {
 		u.ok("this host will run jobs with the " + string(chosen) + " backend")
 	}
@@ -346,6 +419,9 @@ func Join(ctx context.Context, opts JoinOptions) error {
 	if isolation.usesVMPal() {
 		cfg.Agent.VMPal = isolation.vmpal
 	}
+	if isolation.usesUser() {
+		cfg.Agent.JobUsers = isolation.jobUsers
+	}
 	cfg.Database.Path = filepath.Join(opts.stateDir(), "agent.db")
 	// The agent token lives in the credentials file the join just wrote, with
 	// mode 0600, and never in the config file: zoomies.yaml is 0640 and ends up
@@ -358,6 +434,11 @@ func Join(ctx context.Context, opts JoinOptions) error {
 	}
 	if err := cfg.Save(configFile); err != nil {
 		return fmt.Errorf("installer: writing %s: %w", configFile, err)
+	}
+	if isolation.usesUser() {
+		if err := os.Chmod(configFile, 0o600); err != nil {
+			return fmt.Errorf("installer: closing %s to everybody but root: %w", configFile, err)
+		}
 	}
 	u.ok("wrote " + configFile)
 	u.note("credentials are in " + agent.StatePath(workDir) + " (mode 0600)")
@@ -398,6 +479,7 @@ func Join(ctx context.Context, opts JoinOptions) error {
 		ConfigDir:   opts.configDir(),
 		WantsDocker: chosen != store.BackendProcess,
 		RuntimeName: string(chosen),
+		Env:         serviceEnv,
 	})
 	if err != nil {
 		return err
@@ -568,11 +650,13 @@ func buildRegistry(ctx context.Context, det Detection, opts JoinOptions, workDir
 
 // joinIsolation is what a join decided about how this host's jobs are isolated.
 type joinIsolation struct {
-	mode  string
-	vmpal config.VMPalConfig
+	mode     string
+	vmpal    config.VMPalConfig
+	jobUsers config.JobUsersConfig
 }
 
 func (i joinIsolation) usesVMPal() bool { return i.mode == config.ProcessIsolationVMPal }
+func (i joinIsolation) usesUser() bool  { return i.mode == config.ProcessIsolationUser }
 
 // decideJoinIsolation applies the join's rules for process isolation. It writes
 // nothing and contacts nothing, so that every refusal leaves the token unspent.
@@ -580,14 +664,22 @@ func decideJoinIsolation(opts JoinOptions, det Detection) (joinIsolation, error)
 	const unspent = "nothing has been redeemed"
 	mode, file := opts.ProcessIsolation, opts.VMPalConfigFile
 	switch mode {
-	case "", config.ProcessIsolationNone, config.ProcessIsolationVMPal:
+	case "", config.ProcessIsolationNone, config.ProcessIsolationVMPal, config.ProcessIsolationUser:
 	default:
-		return joinIsolation{}, fmt.Errorf("installer: --process-isolation %q is not a mode; use vmpal or none. %s", mode, unspent)
+		return joinIsolation{}, fmt.Errorf("installer: --process-isolation %q is not a mode; use vmpal, user or none. %s", mode, unspent)
 	}
 	if mode == "" && det.OS == "darwin" {
 		return joinIsolation{}, fmt.Errorf("installer: on a Mac, say what keeps jobs off this machine: run zoomies agent join "+
-			"with --process-isolation vmpal --vmpal-config <file> to run each job in a VM, or --process-isolation none to run "+
+			"with --process-isolation vmpal --vmpal-config <file> to run each job in a VM, --process-isolation user "+
+			"--job-users-config <file> to run each job as a local account of its own, or --process-isolation none to run "+
 			"jobs directly on this Mac; %s", unspent)
+	}
+	if mode != config.ProcessIsolationUser && opts.JobUsersConfigFile != "" {
+		return joinIsolation{}, fmt.Errorf("installer: --job-users-config only applies with --process-isolation user; "+
+			"add that flag or remove the file. %s", unspent)
+	}
+	if mode == config.ProcessIsolationUser {
+		return decideJobUserIsolation(opts, det)
 	}
 	if mode != config.ProcessIsolationVMPal {
 		if file != "" {
@@ -631,6 +723,49 @@ func decideJoinIsolation(opts JoinOptions, det Detection) (joinIsolation, error)
 		return joinIsolation{}, fmt.Errorf("installer: %s cannot be used, and %s: %w", file, unspent, err)
 	}
 	return joinIsolation{mode: mode, vmpal: settings}, nil
+}
+
+// decideJobUserIsolation is decideJoinIsolation for --process-isolation user. It
+// needs root, where VM isolation refuses it: the agent starts each runner as its
+// job user, which only root can, and root's LaunchDaemon is what keeps it up.
+func decideJobUserIsolation(opts JoinOptions, det Detection) (joinIsolation, error) {
+	const unspent = "nothing has been redeemed"
+	file := opts.JobUsersConfigFile
+	switch {
+	case det.OS != "darwin":
+		return joinIsolation{}, fmt.Errorf("installer: --process-isolation user only runs on a Mac, and this host runs %s; %s", det.OS, unspent)
+	case !det.Root:
+		return joinIsolation{}, fmt.Errorf("installer: job-user isolation must be joined as root, because the agent runs as root to start each job as its own "+
+			"account and to write its firewall rules. Run this again with sudo; %s", unspent)
+	case file == "":
+		return joinIsolation{}, fmt.Errorf("installer: --process-isolation user needs --job-users-config <file> holding the agent.job_users settings; %s", unspent)
+	case opts.Backend != "" && opts.Backend != store.BackendProcess:
+		return joinIsolation{}, fmt.Errorf("installer: --backend %s cannot be used with --process-isolation user, which only runs "+
+			"jobs as job users. Remove --backend; %s", opts.Backend, unspent)
+	case opts.DockerHost != "":
+		return joinIsolation{}, fmt.Errorf("installer: --docker-host cannot be used with --process-isolation user, which never "+
+			"uses a container runtime. Remove it; %s", unspent)
+	}
+	settings, err := config.LoadJobUsersFile(file)
+	if err != nil {
+		return joinIsolation{}, fmt.Errorf("installer: %w; %s", err, unspent)
+	}
+	candidate := config.Default()
+	candidate.Agent.Embedded = false
+	candidate.Agent.ControllerURL = opts.ControllerURL
+	candidate.Agent.ProcessIsolation = config.ProcessIsolationUser
+	candidate.Agent.JobUsers = settings
+	if opts.Capacity > 0 {
+		candidate.Agent.Capacity = opts.Capacity
+	} else {
+		candidate.Agent.Capacity = min(defaultCapacity(det), config.MaxJobUsersCapacity)
+	}
+	// The file this join writes is where the value will come from.
+	candidate.Note("agent.process_isolation", config.SourceFile)
+	if err := candidate.ProcessIsolationFindings(det.OS).Err(); err != nil {
+		return joinIsolation{}, fmt.Errorf("installer: %s cannot be used, and %s: %w", file, unspent, err)
+	}
+	return joinIsolation{mode: config.ProcessIsolationUser, jobUsers: settings}, nil
 }
 
 // newVMPalRegistry builds the VM-only registry from what the join decided.

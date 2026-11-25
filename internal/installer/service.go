@@ -200,12 +200,19 @@ type ServiceSpec struct {
 	// LogFile is where launchd sends stdout and stderr, since macOS has no
 	// journal.
 	LogFile string
+	// Env is extra environment for a launchd job, which starts with almost none.
+	// Names and values are written into the plist, so neither may hold a line
+	// break.
+	Env []ServiceEnv
 	// EnvFile is an environment file the unit reads before it starts, and is
 	// allowed not to exist. A machine a provider clones is enrolled by having
 	// this file written into it, so the unit in the template has to name it
 	// before the file is there.
 	EnvFile string
 }
+
+// ServiceEnv is one environment variable of a launchd job.
+type ServiceEnv struct{ Name, Value string }
 
 // Label is the launchd job label, which doubles as the plist's file name.
 func (s ServiceSpec) Label() string {
@@ -278,6 +285,11 @@ func (s *ServiceSpec) defaults() error {
 	} {
 		if strings.ContainsAny(p.value, "\r\n\x00") {
 			return fmt.Errorf("installer: the %s path %q has a line break in it, which a unit file cannot hold; check the path you gave", p.name, p.value)
+		}
+	}
+	for _, e := range s.Env {
+		if strings.ContainsAny(e.Name+e.Value, "\r\n\x00") {
+			return fmt.Errorf("installer: the environment variable %q has a line break in it, which a unit file cannot hold", e.Name)
 		}
 	}
 	if s.LogFile == "" {

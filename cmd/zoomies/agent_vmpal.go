@@ -15,7 +15,9 @@ import (
 // flags became without the join probing the real host's container runtimes.
 var installerJoin = installer.Join
 
-// prepareVMPalAgent settles what VM isolation implies, before validation reads it.
+// prepareVMPalAgent settles what VM or job-user isolation implies, before
+// validation reads it. Job users share the rule: they are a process backend of a
+// standalone agent, and the validator refuses them on an embedded one.
 //
 // This process is `zoomies agent`, so it is not an embedded agent whatever the
 // default says; the validator refuses vmpal on an embedded agent because a
@@ -23,7 +25,7 @@ var installerJoin = installer.Join
 // backend kind is process because that is the kind the VM backend registers as,
 // and a default of docker would name a backend this registry does not hold.
 func prepareVMPalAgent(cfg *config.Config) {
-	if cfg.Agent.ProcessIsolation != config.ProcessIsolationVMPal {
+	if cfg.Agent.ProcessIsolation != config.ProcessIsolationVMPal && cfg.Agent.ProcessIsolation != config.ProcessIsolationUser {
 		return
 	}
 	cfg.Agent.Embedded = false
@@ -34,6 +36,9 @@ func prepareVMPalAgent(cfg *config.Config) {
 // holds the VM backend and nothing else: Docker, Podman or the bare process
 // backend beside it would each be a way for a job to run on the Mac itself.
 func buildAgentBackends(ctx context.Context, cfg *config.Config, log *slog.Logger) (*backend.Registry, error) {
+	if cfg.Agent.ProcessIsolation == config.ProcessIsolationUser {
+		return buildJobUserBackends(ctx, cfg, log)
+	}
 	if cfg.Agent.ProcessIsolation != config.ProcessIsolationVMPal {
 		return buildBackends(ctx, cfg, log)
 	}

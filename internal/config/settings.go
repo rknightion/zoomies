@@ -556,9 +556,9 @@ var registry = buildRegistry([]Setting{
 		Key: "agent.process_isolation", Label: "Process isolation", Env: "ZOOMIES_AGENT_PROCESS_ISOLATION", Kind: KindEnum, Scope: ScopeLocal,
 		// Empty is a choice because it is the default, "nobody said", and the
 		// stored text of a default has to parse back. A Mac refuses it.
-		Choices:       []string{"", ProcessIsolationNone, ProcessIsolationVMPal},
+		Choices:       []string{"", ProcessIsolationNone, ProcessIsolationVMPal, ProcessIsolationUser},
 		RestartReason: "the agent reads this when it starts",
-		Summary:       "What keeps a process-backend job off this machine: vmpal runs each runner in a throwaway macOS VM, none runs it directly on the host. A remote agent on a Mac must have this in its config file.",
+		Summary:       "What keeps a process-backend job off this machine: vmpal runs each runner in a throwaway macOS VM, user runs each job as a local account of its own on a Mac with its home wiped afterwards, none runs it directly on the host. A remote agent on a Mac must have this in its config file.",
 	},
 	{
 		Key: "agent.vmpal.binary", Label: "VMPal command", Env: "ZOOMIES_AGENT_VMPAL_BINARY", Kind: KindString, Scope: ScopeLocal,
@@ -604,6 +604,16 @@ var registry = buildRegistry([]Setting{
 		Key: "agent.vmpal.egress_must_block", Label: "VMPal egress that must fail", Env: "ZOOMIES_AGENT_VMPAL_EGRESS_MUST_BLOCK", Kind: KindStrings, Scope: ScopeLocal,
 		RestartReason: "the agent reads this when it starts",
 		Summary:       "The IP-literal host:port targets a clone must not reach before it is given a credential. Required with vmpal isolation.",
+	},
+	{
+		Key: "agent.job_users.egress_must_allow", Label: "Job users egress that must work", Env: "ZOOMIES_AGENT_JOB_USERS_EGRESS_MUST_ALLOW", Kind: KindStrings, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "The host:port targets a job user must reach before each job. Required with user isolation.",
+	},
+	{
+		Key: "agent.job_users.egress_must_block", Label: "Job users egress that must fail", Env: "ZOOMIES_AGENT_JOB_USERS_EGRESS_MUST_BLOCK", Kind: KindStrings, Scope: ScopeLocal,
+		RestartReason: "the agent reads this when it starts",
+		Summary:       "The IPv4-literal host:port targets a job user must not reach before each job. Required with user isolation.",
 	},
 
 	// ---------------------------------------------------------------------

@@ -100,6 +100,10 @@ type ProcessOptions struct {
 	DownloadBaseURL string
 	HTTPClient      *http.Client
 	Logger          *slog.Logger
+	// JobUsers, when set, runs every runner as a local account of its own whose
+	// home is wiped after the job (see process_jobuser.go). Nil is the plain
+	// backend, exactly as it always was.
+	JobUsers *JobUserOptions
 }
 
 // ProcessBackend runs runners as ordinary processes on the host.
@@ -123,6 +127,9 @@ type ProcessBackend struct {
 	// installing serialises release downloads so two concurrent creates do not
 	// fetch the same archive twice.
 	installing sync.Mutex
+
+	// jobUsers is nil unless the backend was given JobUserOptions.
+	jobUsers *jobUsers
 }
 
 var _ Backend = (*ProcessBackend)(nil)
@@ -155,7 +162,7 @@ func NewProcess(opts ProcessOptions) (*ProcessBackend, error) {
 		base = defaultRunnerDownloadURL
 	}
 
-	return &ProcessBackend{
+	b := &ProcessBackend{
 		root:            abs,
 		version:         version,
 		sha256:          strings.ToLower(strings.TrimSpace(opts.RunnerSHA256)),
@@ -164,7 +171,13 @@ func NewProcess(opts ProcessOptions) (*ProcessBackend, error) {
 		http:            client,
 		log:             log.With("backend", string(store.BackendProcess)),
 		running:         make(map[string]*child),
-	}, nil
+	}
+	if opts.JobUsers != nil {
+		if b.jobUsers, err = newJobUsers(*opts.JobUsers, abs, b.log); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 // Kind identifies the implementation.
@@ -177,6 +190,9 @@ func (b *ProcessBackend) Kind() store.BackendKind { return store.BackendProcess 
 // missing library is the most common cause of a runner that dies seconds after
 // launch with a stack trace nobody reads, so it is checked here and named.
 func (b *ProcessBackend) Probe(ctx context.Context) Info {
+	if b.jobUsers != nil {
+		return b.probeJobUsers(ctx)
+	}
 	info := Info{
 		Kind:     store.BackendProcess,
 		Version:  b.version,
@@ -260,6 +276,9 @@ func (b *ProcessBackend) CreateWithResult(ctx context.Context, spec Spec) (Creat
 	}
 	if spec.DockerMode == store.DockerDinD {
 		return CreateResult{}, fmt.Errorf("backend: pool %q asks for docker-in-docker, which the process backend cannot provide; move the pool to the docker backend", spec.PoolName)
+	}
+	if b.jobUsers != nil {
+		return b.createJobUser(ctx, spec, started)
 	}
 
 	version := strings.TrimPrefix(strings.TrimSpace(spec.RunnerVersion), "v")
@@ -379,7 +398,15 @@ func transientStartError(err error) bool {
 // start launches the listener detached and records enough on disk for a future
 // agent process to find it again.
 func (b *ProcessBackend) start(dir string, args, env []string, spec Spec, version string) error {
-	bin := filepath.Join(dir, listenerPath)
+	return b.startRunner(dir, dir, nil, args, env, spec, version)
+}
+
+// startRunner is start with the runner's record folder and the folder it runs
+// in told apart, which they are in job-user mode: the log, pid, metadata and
+// exit files stay with the agent, and the runner lives in its job user's home.
+// A non-nil slot starts it as that account.
+func (b *ProcessBackend) startRunner(dir, runDir string, slot *jobUserSlot, args, env []string, spec Spec, version string) error {
+	bin := filepath.Join(runDir, listenerPath)
 	if _, err := os.Stat(bin); err != nil {
 		return fmt.Errorf("backend: the runner binary %s is missing: %w", bin, err)
 	}
@@ -395,7 +422,7 @@ func (b *ProcessBackend) start(dir string, args, env []string, spec Spec, versio
 	// twice, and the refusal above leaves the log file it was handed intact.
 	newCmd := func() *exec.Cmd {
 		c := exec.Command(bin, args...)
-		c.Dir = dir
+		c.Dir = runDir
 		c.Env = env
 		c.Stdout = logFile
 		c.Stderr = logFile
@@ -409,7 +436,12 @@ func (b *ProcessBackend) start(dir string, args, env []string, spec Spec, versio
 			time.Sleep(startBackoff)
 		}
 		cmd = newCmd()
-		if startErr = cmd.Start(); startErr == nil {
+		if slot != nil {
+			startErr = b.jobUsers.sys.Start(cmd, slot.uid, jobUserGID)
+		} else {
+			startErr = cmd.Start()
+		}
+		if startErr == nil {
 			break
 		}
 		if !transientStartError(startErr) {
@@ -435,6 +467,9 @@ func (b *ProcessBackend) start(dir string, args, env []string, spec Spec, versio
 		PID:       cmd.Process.Pid,
 		CreatedAt: now,
 		StartedAt: now,
+	}
+	if slot != nil {
+		meta.Slot, meta.RunDir = slot.name, runDir
 	}
 	meta.ProcessIdentity, err = processIdentity(meta.PID)
 	if err != nil {
@@ -682,6 +717,9 @@ func (b *ProcessBackend) Stop(ctx context.Context, h Handle, timeout time.Durati
 	if timeout <= 0 {
 		timeout = defaultStopTimeout
 	}
+	if b.jobUsers != nil {
+		b.jobUsers.noteStop(dir)
+	}
 
 	proc, err := os.FindProcess(pid)
 	if err != nil {
@@ -783,6 +821,10 @@ func (b *ProcessBackend) wipe(ctx context.Context, dir string) error {
 	}, reapGrace, 10*time.Millisecond) {
 		b.log.Warn("a runner's exit was still being recorded when its directory was removed",
 			"dir", dir, "waited", reapGrace)
+	}
+
+	if b.jobUsers != nil {
+		b.finishJobUser(ctx, dir)
 	}
 
 	if err := removeAllRetry(ctx, dir, removeGrace, os.RemoveAll); err != nil {
@@ -1345,6 +1387,11 @@ type processMeta struct {
 	ProcessIdentity string    `json:"process_identity,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	StartedAt       time.Time `json:"started_at"`
+	// Slot and RunDir are set only for a runner started as a job user: its
+	// account, and where it runs, which is not the record folder. Empty means
+	// the plain layout, so a record written before job users read back unchanged.
+	Slot   string `json:"job_user_slot,omitempty"`
+	RunDir string `json:"run_dir,omitempty"`
 }
 
 func writeMeta(dir string, m processMeta) error {

@@ -859,7 +859,9 @@ func (c *Config) validateAgentOn(goos string, add func(Finding)) {
 		}
 		// With VM isolation the steps run in a throwaway guest, so a warning that
 		// they run directly on this host would be false.
-		if c.Agent.Backend == "process" && c.Agent.ProcessIsolation != ProcessIsolationVMPal {
+		// With job-user isolation the steps run as a local account of their own, so
+		// a warning that they run as the agent's user would be false too.
+		if c.Agent.Backend == "process" && c.Agent.ProcessIsolation != ProcessIsolationVMPal && c.Agent.ProcessIsolation != ProcessIsolationUser {
 			add(Finding{
 				Code: "agent.process_backend", Severity: SeverityWarning, Setting: "agent.backend",
 				Title: "the process backend gives jobs no container isolation",
@@ -868,7 +870,9 @@ func (c *Config) validateAgentOn(goos string, add func(Finding)) {
 				Fix: "use the docker or podman backend unless you specifically need host access.",
 			})
 		}
-		if euid() == 0 && c.Agent.Backend == "process" {
+		// Root is how a job-user agent starts each runner as its account, and the
+		// jobs never run as root, so the warning would be untrue there.
+		if euid() == 0 && c.Agent.Backend == "process" && c.Agent.ProcessIsolation != ProcessIsolationUser {
 			add(Finding{
 				Code: "agent.process_root", Severity: SeverityWarning, Setting: "agent.backend",
 				Title:  "the process backend is running as root",
@@ -1009,13 +1013,17 @@ func (c *Config) validateProcessIsolation(goos string, add func(Finding)) {
 			Code: "agent.process_isolation_required", Severity: SeverityError, Setting: "agent.process_isolation",
 			Title:  "a remote agent on a Mac must have agent.process_isolation in its config file",
 			Detail: "without it this agent could run workflow steps directly on the Mac. A value from the environment does not count, because a build that did not know the setting would ignore it.",
-			Fix:    "add process_isolation: vmpal under agent: in zoomies.yaml to run each job in a VM, or process_isolation: none to run jobs directly on this Mac.",
+			Fix:    "add process_isolation: vmpal under agent: in zoomies.yaml to run each job in a VM, process_isolation: user to run each job as a local account of its own, or process_isolation: none to run jobs directly on this Mac.",
 		})
 	}
 	c.refuseUnknownChoice(add, Finding{
 		Code: "agent.vmpal_invalid", Severity: SeverityError, Setting: "agent.process_isolation",
 		Title: fmt.Sprintf("%q is not a process isolation mode", value),
 	}, value)
+	if value == ProcessIsolationUser {
+		c.validateJobUsers(goos, add)
+		return
+	}
 	if value != ProcessIsolationVMPal {
 		return
 	}
@@ -1056,6 +1064,119 @@ func (c *Config) validateProcessIsolation(goos string, add func(Finding)) {
 	}
 }
 
+// validateJobUsers holds job-user isolation to what it needs. Every refusal
+// has a code of its own, so that the Hosts page and the docs can say which.
+func (c *Config) validateJobUsers(goos string, add func(Finding)) {
+	if goos != "darwin" {
+		add(Finding{
+			Code: "agent.job_users_not_macos", Severity: SeverityError, Setting: "agent.process_isolation",
+			Title:  "job-user isolation only runs on a Mac",
+			Detail: "this host runs " + goos + ", and job users are local macOS accounts with a pf firewall anchor.",
+			Fix:    "remove agent.process_isolation on this host, or move this agent to a Mac.",
+		})
+	}
+	// A controller with an embedded agent builds its backends without asking
+	// about isolation, so the setting there would run jobs as the agent itself.
+	if c.Agent.ControllerURL == "" || c.Agent.Embedded {
+		add(Finding{
+			Code: "agent.job_users_embedded", Severity: SeverityError, Setting: "agent.process_isolation",
+			Title:  "job-user isolation needs a standalone agent",
+			Detail: "the agent embedded in a controller does not use the job-user launcher, so its jobs would run directly on this host.",
+			Fix:    "run this Mac as a standalone agent with `zoomies agent join`, with agent.embedded false and agent.controller_url set.",
+		})
+	}
+	if c.Agent.FinishedRetention != 0 {
+		add(Finding{
+			Code: "agent.job_users_finished_retention", Severity: SeverityError, Setting: "agent.finished_retention",
+			Title:  "job-user isolation cannot keep finished runners",
+			Detail: "a finished runner kept for inspection would hold a job user the controller believes is free.",
+			Fix:    "set agent.finished_retention to 0s on this host.",
+		})
+	}
+	if c.Agent.Capacity > MaxJobUsersCapacity {
+		add(Finding{
+			Code: "agent.job_users_capacity", Severity: SeverityError, Setting: "agent.capacity",
+			Title:  fmt.Sprintf("agent.capacity is %d, and job users run at most %d jobs at once", c.Agent.Capacity, MaxJobUsersCapacity),
+			Detail: "the host has one local account for each job and one more, and their user IDs are fixed in a range of 48.",
+			Fix:    fmt.Sprintf("set agent.capacity to %d or fewer.", MaxJobUsersCapacity),
+		})
+	}
+	for _, p := range c.Agent.JobUsers.problems() {
+		add(Finding{
+			Code: "agent.job_users_invalid", Severity: SeverityError, Setting: p.setting,
+			Title: p.title,
+			Fix:   p.fix,
+		})
+	}
+}
+
+// problems lists every job-users value that is missing or malformed. Both lists
+// are required: a check with nothing to test would pass. The rules are the VM
+// mode's, held tighter where the job-user check cannot do what the VM's can: a
+// must-block target is an IPv4 literal, an IPv6 one is never judged, and the
+// check has to fit its time limit.
+func (j JobUsersConfig) problems() []vmpalProblem {
+	out := egressTargetProblems("agent.job_users", j.EgressMustAllow, j.EgressMustBlock)
+	bad := func(key, title, fix string) {
+		out = append(out, vmpalProblem{setting: "agent.job_users." + key, title: title, fix: fix})
+	}
+	if n := len(j.EgressMustAllow) + len(j.EgressMustBlock); n > MaxJobUsersEgressTargets {
+		bad("egress_must_allow", fmt.Sprintf("agent.job_users names %d egress targets in all, and at most %d fit the check's time limit", n, MaxJobUsersEgressTargets), "list fewer targets: a working must-block target costs a full connection attempt before every job.")
+	}
+	for _, target := range j.EgressMustAllow {
+		if host, ok := vmpalHostPort(target); ok {
+			if addr, err := netip.ParseAddr(host); err == nil && !addr.Is4() {
+				bad("egress_must_allow", fmt.Sprintf("%q in agent.job_users.egress_must_allow is an IPv6 address", target), "use a host name or an IPv4 address: the check does not judge IPv6.")
+			}
+		}
+	}
+	for _, target := range j.EgressMustBlock {
+		if host, ok := vmpalHostPort(target); ok {
+			if addr, err := netip.ParseAddr(host); err == nil && (!addr.Is4() || addr.IsLoopback() || addr.IsUnspecified()) {
+				bad("egress_must_block", fmt.Sprintf("%q in agent.job_users.egress_must_block cannot be used", target), "use an IPv4 address on the LAN or the tailnet, not loopback or IPv6: loopback is always open to a job, and the check does not judge IPv6.")
+			}
+		}
+	}
+	return out
+}
+
+// MaxJobUsersEgressTargets is how many egress targets fit the check before each
+// job, which spends a full connection attempt on every must-block target that
+// is working.
+const MaxJobUsersEgressTargets = 8
+
+// egressTargetProblems is the rule both modes share for the two target lists:
+// each must be there, an allow target is host:port, and a block target is an IP
+// literal and port. prefix is the settings' path, agent.vmpal or agent.job_users.
+func egressTargetProblems(prefix string, allow, block []string) []vmpalProblem {
+	var out []vmpalProblem
+	bad := func(key, title, fix string) {
+		out = append(out, vmpalProblem{setting: prefix + "." + key, title: title, fix: fix})
+	}
+	if len(allow) == 0 {
+		bad("egress_must_allow", prefix+".egress_must_allow is empty", "list at least one host:port a job must reach, such as github.com:443.")
+	}
+	for _, target := range allow {
+		if _, ok := vmpalHostPort(target); !ok {
+			bad("egress_must_allow", fmt.Sprintf("%q in %s.egress_must_allow is not host:port", target, prefix), "write each target as host:port, such as github.com:443.")
+		}
+	}
+	if len(block) == 0 {
+		bad("egress_must_block", prefix+".egress_must_block is empty", "list at least one IP address and port a job must not reach, such as 198.51.100.10:443.")
+	}
+	for _, target := range block {
+		host, ok := vmpalHostPort(target)
+		if ok {
+			_, err := netip.ParseAddr(host)
+			ok = err == nil
+		}
+		if !ok {
+			bad("egress_must_block", fmt.Sprintf("%q in %s.egress_must_block is not an IP address and port", target, prefix), "write each target as an IP literal and port, such as 198.51.100.10:443, so that no resolver can make the check pass.")
+		}
+	}
+	return out
+}
+
 // vmpalProblem is one value VM isolation cannot run with.
 type vmpalProblem struct{ setting, title, fix string }
 
@@ -1088,27 +1209,7 @@ func (v VMPalConfig) problems() []vmpalProblem {
 	if !strings.HasPrefix(v.PolicyCheck, "/") {
 		bad("policy_check", "agent.vmpal.policy_check must be an absolute path", "set it to the command that attests this Mac's firewall policy.")
 	}
-	if len(v.EgressMustAllow) == 0 {
-		bad("egress_must_allow", "agent.vmpal.egress_must_allow is empty", "list at least one host:port a job must reach, such as github.com:443.")
-	}
-	for _, target := range v.EgressMustAllow {
-		if _, ok := vmpalHostPort(target); !ok {
-			bad("egress_must_allow", fmt.Sprintf("%q in agent.vmpal.egress_must_allow is not host:port", target), "write each target as host:port, such as github.com:443.")
-		}
-	}
-	if len(v.EgressMustBlock) == 0 {
-		bad("egress_must_block", "agent.vmpal.egress_must_block is empty", "list at least one IP address and port a job must not reach, such as 198.51.100.10:443.")
-	}
-	for _, target := range v.EgressMustBlock {
-		host, ok := vmpalHostPort(target)
-		if ok {
-			_, err := netip.ParseAddr(host)
-			ok = err == nil
-		}
-		if !ok {
-			bad("egress_must_block", fmt.Sprintf("%q in agent.vmpal.egress_must_block is not an IP address and port", target), "write each target as an IP literal and port, such as 198.51.100.10:443, so that no resolver can make the check pass.")
-		}
-	}
+	out = append(out, egressTargetProblems("agent.vmpal", v.EgressMustAllow, v.EgressMustBlock)...)
 	return out
 }
 

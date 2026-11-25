@@ -147,6 +147,11 @@ than about what any one setting says.
 | `agent.vmpal_not_macos` | error | `agent.process_isolation` | VM isolation is set on a host that is not a Mac. |
 | `agent.vmpal_embedded` | error | `agent.process_isolation` | VM isolation is set where a controller's embedded agent would run the jobs, or with no controller URL. It needs a standalone agent with `agent.embedded` false. |
 | `agent.vmpal_finished_retention` | error | `agent.finished_retention` | VM isolation with a non-zero retention: a finished clone would hold a VM slot the controller believes is free. Set it to `0s`. |
+| `agent.job_users_not_macos` | error | `agent.process_isolation` | Job-user isolation is set on a host that is not a Mac. It makes local macOS accounts and loads a pf firewall anchor. |
+| `agent.job_users_embedded` | error | `agent.process_isolation` | Job-user isolation is set where a controller's embedded agent would run the jobs, or with no controller URL. It needs a standalone agent with `agent.embedded` false. |
+| `agent.job_users_finished_retention` | error | `agent.finished_retention` | Job-user isolation with a non-zero retention: a finished runner would hold a job user the controller believes is free. Set it to `0s`. |
+| `agent.job_users_invalid` | error | `agent.job_users.*` | An egress list for job users is missing or malformed. Both `egress_must_allow` and `egress_must_block` are required, a block target is an IPv4 literal with a port, and at most eight targets fit the check. The finding names the setting and what to write there. |
+| `agent.job_users_capacity` | error | `agent.capacity` | Job-user isolation with a capacity over 47. The host has one local account for each job and one more, and their user IDs are fixed in a range of 48. |
 | `agent.root` | warning | `agent` | The agent process is running as root. Raised only where an agent actually runs. |
 | `agent.insecure_tls` | warning | `agent.insecure_skip_verify` | The agent does not verify the controller's certificate, so anything on the path can impersonate it. |
 | `agent.insecure_http` | warning | `agent.allow_insecure_http` | The agent talks to the controller over plain HTTP, so its token and every runner's credentials cross the network in the clear. |
