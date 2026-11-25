@@ -8,10 +8,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -26,7 +24,7 @@ const (
 	// jobUserUIDBase plus a slot's number is its UID. The range is above the 501
 	// and up that macOS gives to people, and outside the 450 to 499 that role
 	// accounts take. It is fixed in the code and not configurable, because the
-	// firewall rules and the checks below are written against it.
+	// checks below are written against it.
 	jobUserUIDBase = 650
 	// jobUserGID is the primary group every slot shares and no person is in.
 	// A job user must not be in staff: every local account is, and macOS homes
@@ -47,10 +45,6 @@ const (
 	jobUserRunDirName = "actions-runner"
 	// jobUserTrashName is where a wiped home waits to be deleted.
 	jobUserTrashName = ".zoomies-trash"
-	// jobUserAnchor is the pf anchor the agent owns. macOS's stock pf.conf
-	// evaluates every com.apple/ anchor, so the rules are in force without
-	// editing a file the system owns.
-	jobUserAnchor = "com.apple/zoomies-job-users"
 )
 
 var jobUserNamePattern = regexp.MustCompile(`^zj([0-9]{2})$`)
@@ -58,19 +52,14 @@ var jobUserNamePattern = regexp.MustCompile(`^zj([0-9]{2})$`)
 func jobUserName(n int) string { return fmt.Sprintf("zj%02d", n) }
 func jobUserUID(n int) int     { return jobUserUIDBase + n }
 
-// errJobUsersHeld is a refusal to take a job for now. Like the VM backend's it
-// wraps neither ErrUnavailable, which would raise a false container-runtime
-// incident, nor the busy sentinel, which the agent answers by retrying at once.
-var errJobUsersHeld = errors.New("backend: this Mac is not taking new job-user runners for now")
-
 // jobUserSlot is one account.
 type jobUserSlot struct {
 	n    int
 	name string
 	uid  int
 	// offered is whether new jobs may use it. An account above a reduced capacity
-	// is drained: never offered again, but still covered by the firewall, still
-	// stopped when the firewall fails and still reset after the job it holds ends.
+	// is drained: never offered again, but still reset at start-up and after the
+	// job it holds ends.
 	offered bool
 	// exists is whether the Mac has the account, whether or not it is offered. It
 	// is set by ensureSlots before anything else runs, and read after that.
@@ -81,9 +70,6 @@ type jobUserSlot struct {
 	// holder is the runner directory using the slot, or empty when it is free.
 	holder  string
 	healthy bool
-	// admitGen is the stop generation the slot was admitted under, which only the
-	// create that holds the slot reads.
-	admitGen uint64
 	// failures counts resets that failed in a row; nextRetry is when the watcher
 	// tries again; lastErr is what the last one said.
 	failures  int
@@ -94,38 +80,23 @@ type jobUserSlot struct {
 // jobUsers is the whole of the machinery. It is built by NewProcess when the
 // backend is given JobUserOptions, and nothing in it runs until StartJobUsers.
 type jobUsers struct {
-	sys       jobUserSystem
-	log       *slog.Logger
-	now       func() time.Time
-	pause     func(ctx context.Context, d time.Duration)
-	usersDir  string
-	trashDir  string
-	stateDir  string
-	exe       string
-	capacity  int
-	mustAllow []string
-	mustBlock []string
-
-	state *vmpalHostState
-	gate  *vmpalPolicyGate
-	pf    *jobUserPF
+	sys      jobUserSystem
+	log      *slog.Logger
+	now      func() time.Time
+	pause    func(ctx context.Context, d time.Duration)
+	usersDir string
+	trashDir string
+	stateDir string
+	capacity int
 
 	mu    sync.Mutex
 	slots []*jobUserSlot
-	// startMu orders the start of a runner against stopping every job. A create
-	// holds it for reading from its last check to the start of its runner, and
-	// stopAllSlots takes it for writing to count a stop, so a runner is either
-	// started before the stop and killed by it, or sees the stop and is not
-	// started. stopGen is the count, guarded by startMu.
-	startMu sync.RWMutex
-	stopGen uint64
-	// probedHeld and reprobe are the VM backend's pair: whether the last probe
-	// found the host held, and whether something since then needs a fresh one.
-	probedHeld atomic.Bool
-	reprobe    atomic.Bool
+	// reprobe is whether a slot changed health since the last probe, so that the
+	// next one is not served from the cache.
+	reprobe atomic.Bool
 
-	// started is set once StartJobUsers has made the accounts and loaded the
-	// firewall; nothing is admitted before it.
+	// started is set once StartJobUsers has made the accounts; nothing is
+	// admitted before it.
 	started atomic.Bool
 
 	cancel  context.CancelFunc
@@ -139,22 +110,11 @@ type JobUserOptions struct {
 	// Capacity is how many jobs may run at once. The host has one more account
 	// than that.
 	Capacity int
-	// EgressMustAllow and EgressMustBlock are the host:port targets checked
-	// before every job, as the VM backend checks a clone's. Both are required.
-	EgressMustAllow []string
-	EgressMustBlock []string
-	// StateDir holds what must outlive the agent: each slot's manifest, the pf
-	// token and the hold. It must be readable by root alone. Empty means
-	// job-users under the work directory.
+	// StateDir holds what must outlive the agent: each slot's manifest. It must
+	// be readable by root alone. Empty means job-users under the work directory.
 	StateDir string
 	// UsersDir is where homes live. Empty means /Users.
 	UsersDir string
-	// Executable is the zoomies binary that runs the egress probe as a job
-	// user. Empty means this process's own.
-	Executable string
-	// EgressDial is how the agent itself connects to a must-block target. Nil
-	// means a real TCP connection.
-	EgressDial func(ctx context.Context, address string) error
 	// Now is the clock. Nil means the real one.
 	Now func() time.Time
 
@@ -168,14 +128,11 @@ func newJobUsers(o JobUserOptions, workDir string, log *slog.Logger) (*jobUsers,
 	if o.Capacity < 1 || o.Capacity > jobUserMaxCapacity {
 		return nil, fmt.Errorf("%w: agent.capacity is %d, and job users run 1 to %d jobs at once", ErrBackendConfig, o.Capacity, jobUserMaxCapacity)
 	}
-	if err := checkJobUserTargets(o.EgressMustAllow, o.EgressMustBlock); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrBackendConfig, err)
-	}
 	return buildJobUsers(o, workDir, log)
 }
 
-// buildJobUsers is newJobUsers without the checks on what the operator asked
-// for, which removing the accounts has no use for.
+// buildJobUsers is newJobUsers without the capacity check, which removing the
+// accounts has no use for.
 func buildJobUsers(o JobUserOptions, workDir string, log *slog.Logger) (*jobUsers, error) {
 	sys := o.system
 	if sys == nil {
@@ -191,10 +148,7 @@ func buildJobUsers(o JobUserOptions, workDir string, log *slog.Logger) (*jobUser
 		pause:      o.pause,
 		usersDir:   o.UsersDir,
 		stateDir:   o.StateDir,
-		exe:        o.Executable,
 		capacity:   o.Capacity,
-		mustAllow:  append([]string(nil), o.EgressMustAllow...),
-		mustBlock:  append([]string(nil), o.EgressMustBlock...),
 		watchEvery: jobUserWatchEvery,
 	}
 	if u.now == nil {
@@ -215,27 +169,16 @@ func buildJobUsers(o JobUserOptions, workDir string, log *slog.Logger) (*jobUser
 	if u.stateDir == "" {
 		u.stateDir = filepath.Join(workDir, "job-users")
 	}
-	if u.exe == "" {
-		u.exe = executablePath()
-	}
 	u.slots = make([]*jobUserSlot, jobUserMaxSlots)
 	for i := range u.slots {
 		n := i + 1
 		u.slots[i] = &jobUserSlot{n: n, name: jobUserName(n), uid: jobUserUID(n), offered: n <= o.Capacity+1, healthy: true}
 	}
-	u.state = openVMPalHostState(filepath.Join(u.stateDir, "state.json"), u.now, u.log)
-	u.state.heldErr = errJobUsersHeld
-	dial := o.EgressDial
-	if dial == nil {
-		dial = vmpalDialTCP
-	}
-	u.gate = newJobUserGate(u, dial)
-	u.pf = &jobUserPF{u: u}
 	return u, nil
 }
 
-// covered returns every account the firewall, the stop on a breach and the
-// start-up reset must reach: the offered ones and any other that exists.
+// covered returns every account the start-up reset must reach: the offered ones
+// and any other that exists.
 func (u *jobUsers) covered() []*jobUserSlot {
 	var out []*jobUserSlot
 	for _, s := range u.slots {
@@ -673,12 +616,9 @@ func (u *jobUsers) processesOf(ctx context.Context, uid int) ([]jobUserProc, err
 	return out, nil
 }
 
-// executablePath is this binary, which the egress probe runs again as a job
-// user.
-func executablePath() string {
-	p, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-	return p
+// jobUserFirstLine is the first line of what a command printed, for a message
+// that has room for one.
+func jobUserFirstLine(s string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(s), "\n")
+	return line
 }

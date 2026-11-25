@@ -99,39 +99,27 @@ func newVMPalPolicy(mustAllow, mustBlock []string, check string) (vmpalPolicy, e
 		return vmpalPolicy{}, errors.New("agent.vmpal.policy_check is not set")
 	case !filepath.IsAbs(check):
 		return vmpalPolicy{}, errors.New("agent.vmpal.policy_check must be an absolute path")
-	}
-	if err := checkVMPalEgressTargets("agent.vmpal", mustAllow, mustBlock); err != nil {
-		return vmpalPolicy{}, err
-	}
-	return vmpalPolicy{mustAllow: slices.Clone(mustAllow), mustBlock: slices.Clone(mustBlock), check: check}, nil
-}
-
-// checkVMPalEgressTargets holds the two target lists to the rules both modes
-// share. prefix names the settings in what it says: agent.vmpal for VM isolation
-// and agent.job_users for job users.
-func checkVMPalEgressTargets(prefix string, mustAllow, mustBlock []string) error {
-	switch {
 	case len(mustAllow) == 0:
-		return errors.New(prefix + ".egress_must_allow is empty")
+		return vmpalPolicy{}, errors.New("agent.vmpal.egress_must_allow is empty")
 	case len(mustBlock) == 0:
-		return errors.New(prefix + ".egress_must_block is empty")
+		return vmpalPolicy{}, errors.New("agent.vmpal.egress_must_block is empty")
 	case len(mustAllow)+len(mustBlock) > vmpalEgressMaxTargets:
-		return fmt.Errorf("%s.egress_must_allow and egress_must_block name more than %d targets, which will not fit the check's time limit", prefix, vmpalEgressMaxTargets)
+		return vmpalPolicy{}, fmt.Errorf("agent.vmpal.egress_must_allow and egress_must_block name more than %d targets, which will not fit the check's time limit", vmpalEgressMaxTargets)
 	}
 	for _, target := range mustAllow {
 		if err := checkVMPalAllowTarget(target); err != nil {
-			return fmt.Errorf("%s.egress_must_allow: %w", prefix, err)
+			return vmpalPolicy{}, fmt.Errorf("agent.vmpal.egress_must_allow: %w", err)
 		}
 	}
 	for _, target := range mustBlock {
 		if err := checkVMPalBlockTarget(target); err != nil {
-			return fmt.Errorf("%s.egress_must_block: %w", prefix, err)
+			return vmpalPolicy{}, fmt.Errorf("agent.vmpal.egress_must_block: %w", err)
 		}
 		if slices.Contains(mustAllow, target) {
-			return fmt.Errorf("%s.egress_must_block: %s is also in egress_must_allow, so no result could pass", prefix, target)
+			return vmpalPolicy{}, fmt.Errorf("agent.vmpal.egress_must_block: %s is also in egress_must_allow, so no result could pass", target)
 		}
 	}
-	return nil
+	return vmpalPolicy{mustAllow: slices.Clone(mustAllow), mustBlock: slices.Clone(mustBlock), check: check}, nil
 }
 
 func splitVMPalTarget(target string) (string, error) {
@@ -195,29 +183,6 @@ type vmpalPolicyGate struct {
 	policyLimit time.Duration
 	policyGrace time.Duration
 	log         *slog.Logger
-
-	// asker, when set, answers the check's questions in place of guest: job
-	// users ask a slot's own account, and there is no VM to run a helper in. the
-	// and a are what the check calls the thing it asks, in its reasons.
-	asker func(ctx context.Context, name string, targets []string) ([]string, error)
-	the   string
-	a     string
-	// unreachableBlocks reads "unreachable" from a must-block target the Mac itself
-	// reached as a block, like a timeout. It is for job users: the probe runs on
-	// the same host over the same routes as the Mac's own dial, so the firewall is
-	// the only difference, and pf can refuse a packet it drops from a local socket
-	// with an error from the kernel as well as by dropping it silently. A VM guest
-	// has routes of its own, so there it is still a doubt.
-	unreachableBlocks bool
-}
-
-// subject is what the check calls whatever it is testing from, for the reasons
-// an operator reads.
-func (g *vmpalPolicyGate) subject() (the, a string) {
-	if g.the == "" {
-		return "the guest", "a guest"
-	}
-	return g.the, g.a
 }
 
 // policyGate builds the gate for these options. An incomplete policy gets the
@@ -287,15 +252,14 @@ func (g *vmpalPolicyGate) Verify(ctx context.Context, clone vmpalInfo) error {
 // that changes what happens to every other clone on the host.
 func (g *vmpalPolicyGate) check(ctx context.Context, name string) *vmpalEgressFailure {
 	var doubts []string
-	the, a := g.subject()
 
 	answers, err := g.ask(ctx, name, g.policy.mustAllow)
 	if err != nil {
-		return &vmpalEgressFailure{Reason: fmt.Sprintf("%s could not run the check: %v", the, err)}
+		return &vmpalEgressFailure{Reason: fmt.Sprintf("the guest could not run the check: %v", err)}
 	}
 	for i, answer := range answers {
 		if answer != vmpalEgressConnected {
-			doubts = append(doubts, fmt.Sprintf("%s could not reach %s, which it must (%s)", the, g.policy.mustAllow[i], answer))
+			doubts = append(doubts, fmt.Sprintf("the guest could not reach %s, which it must (%s)", g.policy.mustAllow[i], answer))
 		}
 	}
 
@@ -309,30 +273,23 @@ func (g *vmpalPolicyGate) check(ctx context.Context, name string) *vmpalEgressFa
 
 		answers, err := g.ask(ctx, name, []string{target})
 		if err != nil {
-			return &vmpalEgressFailure{Reason: fmt.Sprintf("%s could not run the check: %v", the, err)}
+			return &vmpalEgressFailure{Reason: fmt.Sprintf("the guest could not run the check: %v", err)}
 		}
 		// Judged before the Mac's result: a connection or a refusal means the
 		// guest's packets got there, whether or not the Mac's did.
 		switch answer := answers[0]; {
 		case answer == vmpalEgressConnected || answer == vmpalEgressRefused:
-			return &vmpalEgressFailure{Breach: true, Reason: fmt.Sprintf("%s got an answer from %s (%s), which the firewall must block", a, target, answer)}
+			return &vmpalEgressFailure{Breach: true, Reason: fmt.Sprintf("a guest got an answer from %s (%s), which the firewall must block", target, answer)}
 		case macErr != nil:
-			doubts = append(doubts, fmt.Sprintf("the Mac could not reach must-block target %s, so %s failing to reach it proves nothing; check that it is up (%v)", target, the, macErr))
-		case answer == vmpalEgressUnreachable && g.unreachableBlocks:
-			// Blocked, as a timeout is.
+			doubts = append(doubts, fmt.Sprintf("the Mac could not reach must-block target %s, so the guest failing to reach it proves nothing; check that it is up (%v)", target, macErr))
 		case answer != vmpalEgressTimeout:
-			doubts = append(doubts, fmt.Sprintf("%s's attempt on %s ended in %s rather than timing out", the, target, answer))
+			doubts = append(doubts, fmt.Sprintf("the guest's attempt on %s ended in %s rather than timing out", target, answer))
 		}
 	}
 	if len(doubts) > 0 {
 		return &vmpalEgressFailure{Reason: strings.Join(doubts, "; ")}
 	}
 
-	// Job users have no operator-supplied attestation: the agent writes and
-	// compares the firewall itself, so there is nothing for one to say.
-	if g.policy.check == "" {
-		return nil
-	}
 	if err := g.runPolicyCheck(ctx); err != nil {
 		return &vmpalEgressFailure{Reason: err.Error()}
 	}
@@ -341,9 +298,6 @@ func (g *vmpalPolicyGate) check(ctx context.Context, name string) *vmpalEgressFa
 
 // ask has the guest try these targets, one attempt each.
 func (g *vmpalPolicyGate) ask(ctx context.Context, name string, targets []string) ([]string, error) {
-	if g.asker != nil {
-		return g.asker(ctx, name, targets)
-	}
 	limit := vmpalEgressAttempt * time.Duration(len(targets)+1)
 	out, err := g.guest(ctx, name, limit, map[string]string{vmpalEgressTargetsVar: strings.Join(targets, " ")}, "egress")
 	if err != nil {

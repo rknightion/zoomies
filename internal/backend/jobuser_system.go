@@ -14,8 +14,7 @@ import (
 
 // jobUserCommand is one command the job-user machinery runs.
 type jobUserCommand struct {
-	Argv  []string
-	Stdin string
+	Argv []string
 	// AsUser runs the command as UID and GID with no supplementary groups, which
 	// is how the machinery sees the host the way a job does.
 	AsUser   bool
@@ -34,13 +33,6 @@ type jobUserResult struct {
 // started it.
 type jobUserProc struct {
 	PID, RUID, EUID int
-}
-
-// jobUserIface is one network interface and whether it has an address, which is
-// all the firewall rules need of it.
-type jobUserIface struct {
-	Name    string
-	HasAddr bool
 }
 
 // jobUserMount is one mounted filesystem: where it is mounted, and the user who
@@ -73,7 +65,6 @@ type jobUserSystem interface {
 	// anything larger than max, because the files it is used on belong to a job.
 	ReadFile(path string, max int64) ([]byte, error)
 	Processes(ctx context.Context) ([]jobUserProc, error)
-	Interfaces() ([]jobUserIface, error)
 	// Start starts cmd as uid and gid with no supplementary groups. cmd has its
 	// own process group already.
 	Start(cmd *exec.Cmd, uid, gid int) error

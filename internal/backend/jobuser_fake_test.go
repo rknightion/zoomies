@@ -40,9 +40,6 @@ type fakeJobUsers struct {
 	// stubborn keeps every process alive through pkill, so a reset has to give up.
 	stubborn bool
 	rules    []fakeRule
-	pfRules  string
-	pfToken  int
-	ifaces   []jobUserIface
 	owners   map[string][2]int
 	// lstat answers for paths that cannot exist on the machine the test runs on.
 	lstat   map[string]fs.FileInfo
@@ -53,9 +50,6 @@ type fakeJobUsers struct {
 	started []fakeStart
 	umasks  []int
 	clock   time.Time
-	// probe answers the egress probe: by default every must-allow target connects
-	// and every other one times out.
-	probe func(targets []string) []string
 	// mounts is the mount table, and devs says which filesystem a path is on: a
 	// path not in it is on filesystem 1. Unmounting removes a mount and what it
 	// held from both.
@@ -92,8 +86,6 @@ func newFakeJobUsers(t *testing.T) *fakeJobUsers {
 		homeOf:   map[string]string{},
 		admins:   map[string]bool{},
 		devs:     map[string]uint64{},
-		pfToken:  41,
-		ifaces:   []jobUserIface{{Name: "lo0", HasAddr: true}, {Name: "en0", HasAddr: true}, {Name: "utun3", HasAddr: true}, {Name: "bridge0"}},
 		owners:   map[string][2]int{},
 		lstat:    map[string]fs.FileInfo{},
 		tempDir:  "/var/folders/ab/cdef12/T/",
@@ -359,49 +351,8 @@ func (f *fakeJobUsers) defaultRun(c jobUserCommand) jobUserResult {
 		if err := cloneTree(argv[len(argv)-2], argv[len(argv)-1]); err != nil {
 			return jobUserResult{ExitCode: 1, Output: err.Error()}
 		}
-	case "pfctl":
-		switch {
-		case arg(1) == "-E":
-			f.pfToken++
-			return jobUserResult{Output: fmt.Sprintf("pf enabled\n\nToken : %d\n", f.pfToken)}
-		case arg(1) == "-a" && arg(3) == "-f":
-			f.pfRules = c.Stdin
-		case arg(1) == "-a" && arg(3) == "-sr":
-			return jobUserResult{Output: f.pfRules}
-		case arg(1) == "-a" && arg(3) == "-F":
-			f.pfRules = ""
-		case arg(1) == "-s":
-			return jobUserResult{Output: "Status: Enabled for 0 days 00:00:05\n"}
-		}
-	case "zoomies":
-		if arg(1) == "agent" && arg(2) == "egress-probe" {
-			// zoomies agent egress-probe --timeout 5s <targets>...
-			targets := argv[min(len(argv), 5):]
-			answers := f.defaultProbe(targets)
-			if f.probe != nil {
-				answers = f.probe(targets)
-			}
-			var b strings.Builder
-			for i, a := range answers {
-				fmt.Fprintf(&b, "zoomies-egress v1 target %d %s\n", i, a)
-			}
-			fmt.Fprintf(&b, "zoomies-egress v1 end %d\n", len(answers))
-			return jobUserResult{Output: b.String()}
-		}
 	}
 	return ok
-}
-
-func (f *fakeJobUsers) defaultProbe(targets []string) []string {
-	out := make([]string, len(targets))
-	for i, t := range targets {
-		if strings.HasPrefix(t, "198.51.100.") {
-			out[i] = vmpalEgressTimeout
-		} else {
-			out[i] = vmpalEgressConnected
-		}
-	}
-	return out
 }
 
 func listIDs(m map[string]int) string {
@@ -506,12 +457,6 @@ func (f *fakeJobUsers) Processes(context.Context) ([]jobUserProc, error) {
 	return append([]jobUserProc(nil), f.procs...), nil
 }
 
-func (f *fakeJobUsers) Interfaces() ([]jobUserIface, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]jobUserIface(nil), f.ifaces...), nil
-}
-
 // Start runs the command as the test's own user, which is the most a test can
 // do without root, and records who it would have run as.
 func (f *fakeJobUsers) Start(cmd *exec.Cmd, uid, gid int) error {
@@ -563,16 +508,12 @@ func (x *jobUserFixture) restart(t *testing.T, capacity int, tweak ...func(*JobU
 func buildJobUserFixture(t *testing.T, f *fakeJobUsers, root, state string, capacity int, tweak ...func(*JobUserOptions)) *jobUserFixture {
 	t.Helper()
 	o := JobUserOptions{
-		Capacity:        capacity,
-		EgressMustAllow: []string{"github.com:443"},
-		EgressMustBlock: []string{"198.51.100.10:443"},
-		StateDir:        state,
-		UsersDir:        f.usersDir,
-		Executable:      "/usr/local/bin/zoomies",
-		EgressDial:      func(context.Context, string) error { return nil },
-		Now:             f.now,
-		system:          f,
-		pause:           f.pause,
+		Capacity: capacity,
+		StateDir: state,
+		UsersDir: f.usersDir,
+		Now:      f.now,
+		system:   f,
+		pause:    f.pause,
 	}
 	for _, tw := range tweak {
 		tw(&o)

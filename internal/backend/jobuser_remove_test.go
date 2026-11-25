@@ -47,14 +47,8 @@ func TestRemovingJobUsersDeletesWhatZoomiesMadeAndNothingElse(t *testing.T) {
 	if _, ok := x.f.groups[jobUserGroup]; ok {
 		t.Error("the group is still there")
 	}
-	if x.f.pfRules != "" || x.f.indexOf("pfctl -a "+jobUserAnchor+" -F all") < 0 {
-		t.Error("the anchor was not emptied")
-	}
-	if x.f.indexOf("pfctl -F") >= 0 || x.f.indexOf("pfctl -d") >= 0 {
-		t.Error("pf's other rules were touched")
-	}
-	if x.f.indexOf("pfctl -X 42") < 0 {
-		t.Errorf("pf's reference was not released: %v", x.f.logged())
+	if x.f.count("pfctl") != 0 {
+		t.Errorf("pf was touched, and this mode never edits it: %v", x.f.logged())
 	}
 	if _, err := os.Stat(filepath.Join(x.f.usersDir, jobUserTrashName)); err == nil {
 		t.Error("the trash is still there")
@@ -73,15 +67,15 @@ func TestRemovingJobUsersRefusesAHostWhereAnAccountIsNotZoomiesOwn(t *testing.T)
 	}
 }
 
-func TestRemovingJobUsersLeavesTheGroupAndFirewallWhenAnAccountCannotGo(t *testing.T) {
+func TestRemovingJobUsersLeavesTheGroupWhenAnAccountCannotGo(t *testing.T) {
 	x := removeFixture(t)
 	x.f.fail("sysadminctl", "-deleteUser", "zj02")
 	err := RemoveJobUsers(context.Background(), RemoveJobUsersOptions{StateDir: x.state, UsersDir: x.f.usersDir, Logger: quietLogger(), system: x.f})
 	if err == nil || !strings.Contains(err.Error(), "zj02") {
 		t.Fatalf("err = %v", err)
 	}
-	if _, ok := x.f.groups[jobUserGroup]; !ok || x.f.pfRules == "" {
-		t.Error("the group or the firewall went while an account was still there")
+	if _, ok := x.f.groups[jobUserGroup]; !ok {
+		t.Error("the group went while an account was still there")
 	}
 }
 

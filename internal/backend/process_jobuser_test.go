@@ -98,7 +98,6 @@ func TestJobUserCreateReportsBusyWhenEverySlotIsHeldOrUnhealthy(t *testing.T) {
 
 func TestJobUserCreateReleasesTheReservationWhenAStepFails(t *testing.T) {
 	steps := map[string][]string{
-		"the egress check":        {"zoomies", "agent", "egress-probe"},
 		"asking for the temp dir": {"getconf"},
 		"laying out the runner":   {"cp"},
 		"giving it to the user":   {"chown"},
@@ -118,7 +117,6 @@ func TestJobUserCreateReleasesTheReservationWhenAStepFails(t *testing.T) {
 			t.Errorf("%s: %d records left", name, len(entries))
 		}
 		x.f.clear()
-		x.u.state.file.HoldUntil = time.Time{}
 		jobUserCreate(t, x, "runner-a")
 	}
 }
@@ -168,9 +166,8 @@ func TestJobUserCreateStartsTheListenerAsTheSlotUserInTheSlotsHome(t *testing.T)
 	clone := x.f.indexOf("cp -c -R -P", runDir)
 	chown := x.f.indexOf("chown -R -h 651:650", runDir)
 	start := x.f.indexOf("start " + filepath.Join(runDir, listenerPath))
-	probe := x.f.indexOf("egress-probe")
-	if probe < 0 || clone < 0 || chown < 0 || start < 0 || !(probe < clone && clone < chown && chown < start) {
-		t.Errorf("probe %d, clone %d, chown %d, start %d; want that order: %v", probe, clone, chown, start, x.f.logged())
+	if clone < 0 || chown < 0 || start < 0 || !(clone < chown && chown < start) {
+		t.Errorf("clone %d, chown %d, start %d; want that order: %v", clone, chown, start, x.f.logged())
 	}
 	if st := x.f.umasks; len(st) == 0 || st[0] != 0o022 {
 		t.Errorf("umask calls = %v; the agent sets 022 at start", st)
@@ -436,17 +433,13 @@ func TestJobUserBackendRefusesTheAccountsWhenNothingFitsBeforeStart(t *testing.T
 	}
 }
 
-func TestNewProcessRefusesJobUsersWithNoEgressListsOrTooManyJobs(t *testing.T) {
+func TestNewProcessRefusesJobUsersWithNoJobsOrTooManyJobs(t *testing.T) {
 	f := newFakeJobUsers(t)
 	for name, tweak := range map[string]func(*JobUserOptions){
-		"no allow list": func(o *JobUserOptions) { o.EgressMustAllow = nil },
-		"no block list": func(o *JobUserOptions) { o.EgressMustBlock = nil },
-		"a block name":  func(o *JobUserOptions) { o.EgressMustBlock = []string{"example.com:443"} },
 		"no jobs":       func(o *JobUserOptions) { o.Capacity = 0 },
 		"too many jobs": func(o *JobUserOptions) { o.Capacity = jobUserMaxCapacity + 1 },
-		"an IPv6 block": func(o *JobUserOptions) { o.EgressMustBlock = []string{"[2001:db8::1]:443"} },
 	} {
-		o := JobUserOptions{Capacity: 2, EgressMustAllow: []string{"github.com:443"}, EgressMustBlock: []string{"198.51.100.10:443"}, StateDir: t.TempDir(), system: f}
+		o := JobUserOptions{Capacity: 2, StateDir: t.TempDir(), system: f}
 		tweak(&o)
 		if _, err := NewProcess(ProcessOptions{WorkDir: t.TempDir(), JobUsers: &o, Logger: quietLogger()}); !errors.Is(err, ErrBackendConfig) {
 			t.Errorf("%s: NewProcess = %v", name, err)
@@ -470,27 +463,5 @@ func TestJobUserHostIsNotHeldByRunnersThatExitWithoutTakingAJob(t *testing.T) {
 		if err := x.b.Remove(context.Background(), h); err != nil {
 			t.Fatal(err)
 		}
-		if held := x.u.state.held(); held != nil {
-			t.Fatalf("held after %d runners left without a job: %v", i+1, held)
-		}
-	}
-}
-
-func TestJobUserCreateHoldsTheHostWhenTheFirewallIsGone(t *testing.T) {
-	x := startedJobUserFixture(t, 2)
-	x.f.pfRules = ""
-	x.f.procs = []jobUserProc{{PID: 9, RUID: 652, EUID: 652}}
-	_, err := x.b.CreateWithResult(context.Background(), jobUserSpec("runner-a"))
-	if !errors.Is(err, errJobUsersHeld) {
-		t.Fatalf("create with no firewall = %v", err)
-	}
-	if len(x.f.started) != 0 {
-		t.Error("a runner started with no firewall")
-	}
-	if len(x.f.procs) != 0 {
-		t.Error("a running job was left with no firewall")
-	}
-	if x.u.slotNamed("zj01").holder != "" {
-		t.Error("the slot stayed reserved")
 	}
 }

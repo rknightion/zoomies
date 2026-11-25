@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -36,9 +35,6 @@ func (darwinJobUserSystem) Run(ctx context.Context, c jobUserCommand) (jobUserRe
 	cmd := exec.CommandContext(ctx, c.Argv[0], c.Argv[1:]...)
 	cmd.Env = jobUserCommandEnv
 	cmd.Dir = "/"
-	if c.Stdin != "" {
-		cmd.Stdin = strings.NewReader(c.Stdin)
-	}
 	out := &cappedBuffer{limit: jobUserOutputLimit}
 	cmd.Stdout, cmd.Stderr = out, out
 	if c.AsUser {
@@ -148,22 +144,6 @@ func (s darwinJobUserSystem) Processes(ctx context.Context) ([]jobUserProc, erro
 		return nil, fmt.Errorf("ps exited %d: %s", res.ExitCode, strings.TrimSpace(res.Output))
 	}
 	return parseJobUserProcesses(res.Output)
-}
-
-func (darwinJobUserSystem) Interfaces() ([]jobUserIface, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]jobUserIface, 0, len(ifaces))
-	for _, i := range ifaces {
-		addrs, err := i.Addrs()
-		if err != nil {
-			return nil, fmt.Errorf("reading the addresses of %s: %w", i.Name, err)
-		}
-		out = append(out, jobUserIface{Name: i.Name, HasAddr: len(addrs) > 0})
-	}
-	return out, nil
 }
 
 func (darwinJobUserSystem) Start(cmd *exec.Cmd, uid, gid int) error {

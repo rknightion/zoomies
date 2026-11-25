@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,10 +23,6 @@ func jobUsersAgentConfig(t *testing.T) *config.Config {
 	cfg.Agent.ControllerURL = "https://zoomies.example.com"
 	cfg.Agent.ProcessIsolation = config.ProcessIsolationUser
 	cfg.Agent.Capacity = 3
-	cfg.Agent.JobUsers = config.JobUsersConfig{
-		EgressMustAllow: []string{"github.com:443"},
-		EgressMustBlock: []string{"198.51.100.10:443"},
-	}
 	return cfg
 }
 
@@ -88,8 +83,7 @@ func TestJobUserAgentRegistersOnlyTheJobUserBackend(t *testing.T) {
 		t.Errorf("the job users were set up %d times", h.started)
 	}
 	jo := h.opts.JobUsers
-	if jo == nil || jo.Capacity != 3 || jo.Executable != "/usr/local/bin/zoomies" ||
-		len(jo.EgressMustAllow) != 1 || jo.EgressMustBlock[0] != "198.51.100.10:443" || filepath.Base(jo.StateDir) != "job-users" {
+	if jo == nil || jo.Capacity != 3 || filepath.Base(jo.StateDir) != "job-users" {
 		t.Errorf("the backend was given %+v", jo)
 	}
 	if len(h.binaries) != 1 || h.binaries[0] != "/usr/local/bin/zoomies" {
@@ -165,43 +159,6 @@ func TestOnlyAVMPalOrJobUserAgentHasItsEmbeddedDefaultCleared(t *testing.T) {
 	}
 }
 
-func TestEgressProbeClassifiesEachOutcomeAsTheGuestDoes(t *testing.T) {
-	open, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { open.Close() })
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	closedAddr := closed.Addr().String()
-	closed.Close()
-
-	e, out, _ := newTestEnv(t)
-	err = runAgent(context.Background(), e, []string{"egress-probe", "--timeout", "2s", open.Addr().String(), closedAddr, "not-a-target"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "zoomies-egress v1 target 0 connected\n" +
-		"zoomies-egress v1 target 1 refused\n" +
-		"zoomies-egress v1 target 2 error\n" +
-		"zoomies-egress v1 end 3\n"
-	if out.String() != want {
-		t.Errorf("output:\n%s\nwant:\n%s", out.String(), want)
-	}
-	// The probe is not in the reference, which is made from what each command's
-	// help lists, and it needs a target.
-	e, _, _ = newTestEnv(t)
-	if err := runAgent(context.Background(), e, []string{"egress-probe"}); err == nil {
-		t.Error("a probe with nothing to try was accepted")
-	}
-	e, _, _ = newTestEnv(t)
-	if err := runAgent(context.Background(), e, []string{"egress-probe", "--timeout", "0s", "127.0.0.1:1"}); err == nil {
-		t.Error("a zero timeout was accepted")
-	}
-}
-
 func TestJobUsersRemoveRefusesWhileTheAgentIsLoaded(t *testing.T) {
 	stubJobUsersHost(t)
 	oldLoaded, oldRemove := agentDaemonLoaded, removeJobUsers
@@ -245,7 +202,7 @@ func TestJobUsersRemoveRefusesWhileTheAgentIsLoaded(t *testing.T) {
 	}
 }
 
-func TestAgentJoinHandsTheJobUsersFlagsToTheJoin(t *testing.T) {
+func TestAgentJoinHandsTheJobUsersIsolationToTheJoin(t *testing.T) {
 	var got installer.JoinOptions
 	installerJoin = func(_ context.Context, opts installer.JoinOptions) error {
 		got = opts
@@ -255,11 +212,11 @@ func TestAgentJoinHandsTheJobUsersFlagsToTheJoin(t *testing.T) {
 
 	e, _, _ := newTestEnv(t)
 	err := runAgent(context.Background(), e, []string{"join", "https://zoomies.example.com", "--token", "zoojoin_test",
-		"--non-interactive", "--process-isolation", "user", "--job-users-config", "job-users.yaml", "--capacity", "4"})
+		"--non-interactive", "--process-isolation", "user", "--capacity", "4"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ProcessIsolation != config.ProcessIsolationUser || got.JobUsersConfigFile != "job-users.yaml" || got.Capacity != 4 {
+	if got.ProcessIsolation != config.ProcessIsolationUser || got.Capacity != 4 {
 		t.Fatalf("the join was given %+v", got)
 	}
 }

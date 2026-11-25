@@ -1071,7 +1071,7 @@ func (c *Config) validateJobUsers(goos string, add func(Finding)) {
 		add(Finding{
 			Code: "agent.job_users_not_macos", Severity: SeverityError, Setting: "agent.process_isolation",
 			Title:  "job-user isolation only runs on a Mac",
-			Detail: "this host runs " + goos + ", and job users are local macOS accounts with a pf firewall anchor.",
+			Detail: "this host runs " + goos + ", and job users are local macOS accounts.",
 			Fix:    "remove agent.process_isolation on this host, or move this agent to a Mac.",
 		})
 	}
@@ -1101,80 +1101,6 @@ func (c *Config) validateJobUsers(goos string, add func(Finding)) {
 			Fix:    fmt.Sprintf("set agent.capacity to %d or fewer.", MaxJobUsersCapacity),
 		})
 	}
-	for _, p := range c.Agent.JobUsers.problems() {
-		add(Finding{
-			Code: "agent.job_users_invalid", Severity: SeverityError, Setting: p.setting,
-			Title: p.title,
-			Fix:   p.fix,
-		})
-	}
-}
-
-// problems lists every job-users value that is missing or malformed. Both lists
-// are required: a check with nothing to test would pass. The rules are the VM
-// mode's, held tighter where the job-user check cannot do what the VM's can: a
-// must-block target is an IPv4 literal, an IPv6 one is never judged, and the
-// check has to fit its time limit.
-func (j JobUsersConfig) problems() []vmpalProblem {
-	out := egressTargetProblems("agent.job_users", j.EgressMustAllow, j.EgressMustBlock)
-	bad := func(key, title, fix string) {
-		out = append(out, vmpalProblem{setting: "agent.job_users." + key, title: title, fix: fix})
-	}
-	if n := len(j.EgressMustAllow) + len(j.EgressMustBlock); n > MaxJobUsersEgressTargets {
-		bad("egress_must_allow", fmt.Sprintf("agent.job_users names %d egress targets in all, and at most %d fit the check's time limit", n, MaxJobUsersEgressTargets), "list fewer targets: a working must-block target costs a full connection attempt before every job.")
-	}
-	for _, target := range j.EgressMustAllow {
-		if host, ok := vmpalHostPort(target); ok {
-			if addr, err := netip.ParseAddr(host); err == nil && !addr.Is4() {
-				bad("egress_must_allow", fmt.Sprintf("%q in agent.job_users.egress_must_allow is an IPv6 address", target), "use a host name or an IPv4 address: the check does not judge IPv6.")
-			}
-		}
-	}
-	for _, target := range j.EgressMustBlock {
-		if host, ok := vmpalHostPort(target); ok {
-			if addr, err := netip.ParseAddr(host); err == nil && (!addr.Is4() || addr.IsLoopback() || addr.IsUnspecified()) {
-				bad("egress_must_block", fmt.Sprintf("%q in agent.job_users.egress_must_block cannot be used", target), "use an IPv4 address on the LAN or the tailnet, not loopback or IPv6: loopback is always open to a job, and the check does not judge IPv6.")
-			}
-		}
-	}
-	return out
-}
-
-// MaxJobUsersEgressTargets is how many egress targets fit the check before each
-// job, which spends a full connection attempt on every must-block target that
-// is working.
-const MaxJobUsersEgressTargets = 8
-
-// egressTargetProblems is the rule both modes share for the two target lists:
-// each must be there, an allow target is host:port, and a block target is an IP
-// literal and port. prefix is the settings' path, agent.vmpal or agent.job_users.
-func egressTargetProblems(prefix string, allow, block []string) []vmpalProblem {
-	var out []vmpalProblem
-	bad := func(key, title, fix string) {
-		out = append(out, vmpalProblem{setting: prefix + "." + key, title: title, fix: fix})
-	}
-	if len(allow) == 0 {
-		bad("egress_must_allow", prefix+".egress_must_allow is empty", "list at least one host:port a job must reach, such as github.com:443.")
-	}
-	for _, target := range allow {
-		if _, ok := vmpalHostPort(target); !ok {
-			bad("egress_must_allow", fmt.Sprintf("%q in %s.egress_must_allow is not host:port", target, prefix), "write each target as host:port, such as github.com:443.")
-		}
-	}
-	if len(block) == 0 {
-		bad("egress_must_block", prefix+".egress_must_block is empty", "list at least one IP address and port a job must not reach, such as 198.51.100.10:443.")
-	}
-	for _, target := range block {
-		host, ok := vmpalHostPort(target)
-		if ok {
-			_, err := netip.ParseAddr(host)
-			ok = err == nil
-		}
-		if !ok {
-			bad("egress_must_block", fmt.Sprintf("%q in %s.egress_must_block is not an IP address and port", target, prefix), "write each target as an IP literal and port, such as 198.51.100.10:443, so that no resolver can make the check pass.")
-		}
-	}
-	return out
 }
 
 // vmpalProblem is one value VM isolation cannot run with.
@@ -1209,7 +1135,27 @@ func (v VMPalConfig) problems() []vmpalProblem {
 	if !strings.HasPrefix(v.PolicyCheck, "/") {
 		bad("policy_check", "agent.vmpal.policy_check must be an absolute path", "set it to the command that attests this Mac's firewall policy.")
 	}
-	out = append(out, egressTargetProblems("agent.vmpal", v.EgressMustAllow, v.EgressMustBlock)...)
+	if len(v.EgressMustAllow) == 0 {
+		bad("egress_must_allow", "agent.vmpal.egress_must_allow is empty", "list at least one host:port a job must reach, such as github.com:443.")
+	}
+	for _, target := range v.EgressMustAllow {
+		if _, ok := vmpalHostPort(target); !ok {
+			bad("egress_must_allow", fmt.Sprintf("%q in agent.vmpal.egress_must_allow is not host:port", target), "write each target as host:port, such as github.com:443.")
+		}
+	}
+	if len(v.EgressMustBlock) == 0 {
+		bad("egress_must_block", "agent.vmpal.egress_must_block is empty", "list at least one IP address and port a job must not reach, such as 198.51.100.10:443.")
+	}
+	for _, target := range v.EgressMustBlock {
+		host, ok := vmpalHostPort(target)
+		if ok {
+			_, err := netip.ParseAddr(host)
+			ok = err == nil
+		}
+		if !ok {
+			bad("egress_must_block", fmt.Sprintf("%q in agent.vmpal.egress_must_block is not an IP address and port", target), "write each target as an IP literal and port, such as 198.51.100.10:443, so that no resolver can make the check pass.")
+		}
+	}
 	return out
 }
 

@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -23,8 +22,8 @@ type RemoveJobUsersOptions struct {
 }
 
 // RemoveJobUsers undoes what a job-user agent set up: it stops everything the
-// job users run, deletes the accounts, their homes, the trash and the group,
-// empties the firewall anchor and releases pf's reference. It touches only
+// job users run, and deletes the accounts, their homes, the trash and the group.
+// It touches only
 // accounts that are exactly what Zoomies makes, and refuses if any account or
 // group in its range is something else, because deleting a person's account is
 // not a thing to do on the strength of a name. The agent must not be running:
@@ -35,7 +34,7 @@ func RemoveJobUsers(ctx context.Context, o RemoveJobUsersOptions) error {
 		log = slog.Default()
 	}
 	if strings.TrimSpace(o.StateDir) == "" {
-		return fmt.Errorf("backend: removing job users needs the state folder the agent used, so that its firewall token can be released")
+		return fmt.Errorf("backend: removing job users needs the state folder the agent used, so that it can be deleted too")
 	}
 	u, err := buildJobUsers(JobUserOptions{Capacity: jobUserMaxCapacity, StateDir: o.StateDir, UsersDir: o.UsersDir, system: o.system}, "", log)
 	if err != nil {
@@ -84,7 +83,7 @@ func (u *jobUsers) removeAll(ctx context.Context) error {
 		u.log.Info("removed a job user", "slot", s.name)
 	}
 	if len(failed) > 0 {
-		return fmt.Errorf("backend: could not remove every job user, and the group and firewall were left as they are so that this can be run again: %s", strings.Join(failed, "; "))
+		return fmt.Errorf("backend: could not remove every job user, and the group was left as it is so that this can be run again: %s", strings.Join(failed, "; "))
 	}
 
 	if err := u.sys.RemoveAll(u.trashDir); err != nil {
@@ -93,19 +92,6 @@ func (u *jobUsers) removeAll(ctx context.Context) error {
 	if _, ok := groups[jobUserGroup]; ok {
 		if _, err := u.run(ctx, "/usr/bin/dscl", ".", "-delete", "/Groups/"+jobUserGroup); err != nil {
 			return fmt.Errorf("deleting the group %s: %w", jobUserGroup, err)
-		}
-	}
-	// -F all on the anchor only: the rest of pf's rules are not ours.
-	if _, err := u.run(ctx, "/sbin/pfctl", "-a", jobUserAnchor, "-F", "all"); err != nil {
-		return fmt.Errorf("emptying the firewall anchor %s: %w", jobUserAnchor, err)
-	}
-	if tok, err := os.ReadFile(u.pf.tokenPath()); err == nil {
-		if t := strings.TrimSpace(string(tok)); t != "" {
-			if _, err := strconv.Atoi(t); err == nil {
-				if _, err := u.run(ctx, "/sbin/pfctl", "-X", t); err != nil {
-					return fmt.Errorf("releasing pf's reference: %w", err)
-				}
-			}
 		}
 	}
 	if filepath.Base(u.stateDir) == "job-users" {

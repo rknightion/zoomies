@@ -605,16 +605,6 @@ var registry = buildRegistry([]Setting{
 		RestartReason: "the agent reads this when it starts",
 		Summary:       "The IP-literal host:port targets a clone must not reach before it is given a credential. Required with vmpal isolation.",
 	},
-	{
-		Key: "agent.job_users.egress_must_allow", Label: "Job users egress that must work", Env: "ZOOMIES_AGENT_JOB_USERS_EGRESS_MUST_ALLOW", Kind: KindStrings, Scope: ScopeLocal,
-		RestartReason: "the agent reads this when it starts",
-		Summary:       "The host:port targets a job user must reach before each job. Required with user isolation.",
-	},
-	{
-		Key: "agent.job_users.egress_must_block", Label: "Job users egress that must fail", Env: "ZOOMIES_AGENT_JOB_USERS_EGRESS_MUST_BLOCK", Kind: KindStrings, Scope: ScopeLocal,
-		RestartReason: "the agent reads this when it starts",
-		Summary:       "The IPv4-literal host:port targets a job user must not reach before each job. Required with user isolation.",
-	},
 
 	// ---------------------------------------------------------------------
 	// runners -- what every runner is started with. The controller writes

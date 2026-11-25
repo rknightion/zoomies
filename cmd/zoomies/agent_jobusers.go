@@ -55,10 +55,8 @@ func jobUserProcessOptions(cfg *config.Config, log *slog.Logger) backend.Process
 		DownloadBaseURL:         cfg.Agent.RunnerDownloadURL,
 		Logger:                  log,
 		JobUsers: &backend.JobUserOptions{
-			Capacity:        cfg.Agent.Capacity,
-			EgressMustAllow: cfg.Agent.JobUsers.EgressMustAllow,
-			EgressMustBlock: cfg.Agent.JobUsers.EgressMustBlock,
-			StateDir:        filepath.Join(config.StateDir(), "job-users"),
+			Capacity: cfg.Agent.Capacity,
+			StateDir: filepath.Join(config.StateDir(), "job-users"),
 		},
 	}
 }
@@ -73,8 +71,8 @@ func jobUserProcessOptions(cfg *config.Config, log *slog.Logger) backend.Process
 // isolation rests on, so a host that does not meet them does not run jobs.
 func buildJobUserBackends(ctx context.Context, cfg *config.Config, log *slog.Logger) (*backend.Registry, error) {
 	if jobUserEUID() != 0 {
-		return nil, errors.New("agent.process_isolation is user, which needs the agent to run as root: it starts each job as its own local account and writes the firewall rules " +
-			"for them. Run it as a LaunchDaemon, which `sudo zoomies agent join --process-isolation user` installs")
+		return nil, errors.New("agent.process_isolation is user, which needs the agent to run as root: it starts each job as its own local account. " +
+			"Run it as a LaunchDaemon, which `sudo zoomies agent join --process-isolation user` installs")
 	}
 	exe, err := jobUserExecutable()
 	if err != nil {
@@ -91,9 +89,7 @@ func buildJobUserBackends(ctx context.Context, cfg *config.Config, log *slog.Log
 	}); err != nil {
 		return nil, err
 	}
-	opts := jobUserProcessOptions(cfg, log)
-	opts.JobUsers.Executable = exe
-	b, err := newJobUserProcess(opts)
+	b, err := newJobUserProcess(jobUserProcessOptions(cfg, log))
 	if err != nil {
 		return nil, err
 	}
@@ -113,33 +109,13 @@ func buildJobUserBackends(ctx context.Context, cfg *config.Config, log *slog.Log
 	return reg, nil
 }
 
-// runAgentEgressProbe is `zoomies agent egress-probe`. It is not for people: the
-// agent runs it as a job user before that user's job, so that the answer is the
-// one a job would get, and it prints the one-line answers the agent parses.
-func runAgentEgressProbe(ctx context.Context, e *env, args []string) error {
-	fs := newFlagSet(e, "zoomies agent egress-probe [--timeout <duration>] <host:port>...",
-		"Internal. Try one TCP connection to each target and print how each ended, in the lines the agent reads. Run as a job user, before its job.")
-	timeout := fs.Duration("timeout", 5*time.Second, "how long each connection may take")
-	if err := fs.parse(args); err != nil {
-		return err
-	}
-	targets, err := fs.atLeastOneArg("a host:port to try")
-	if err != nil {
-		return err
-	}
-	if *timeout <= 0 {
-		return usagef("agent egress-probe", "--timeout must be positive")
-	}
-	return backend.EgressProbe(ctx, e.out, *timeout, targets)
-}
-
 // runAgentJobUsers is `zoomies agent job-users`.
 func runAgentJobUsers(ctx context.Context, e *env, args []string) error {
 	if len(args) == 0 || args[0] != "remove" {
 		return usagef("agent job-users", "the one subcommand is remove")
 	}
 	fs := newFlagSet(e, "zoomies agent job-users remove",
-		"Delete the job users a job-user agent made: their accounts, homes, the group and the firewall anchor. The agent's LaunchDaemon must be stopped first.")
+		"Delete the job users a job-user agent made: their accounts, homes and the group. The agent's LaunchDaemon must be stopped first.")
 	if err := fs.parse(args[1:]); err != nil {
 		return err
 	}
@@ -160,6 +136,6 @@ func runAgentJobUsers(ctx context.Context, e *env, args []string) error {
 	if err := removeJobUsers(ctx, backend.RemoveJobUsersOptions{StateDir: filepath.Join(config.StateDir(), "job-users"), Logger: log}); err != nil {
 		return err
 	}
-	fmt.Fprintln(e.out, "removed the job users, their group and the firewall anchor")
+	fmt.Fprintln(e.out, "removed the job users and their group")
 	return nil
 }

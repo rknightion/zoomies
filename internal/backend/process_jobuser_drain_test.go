@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -206,12 +205,6 @@ func TestJobUserSlotsAboveAReducedCapacityAreCoveredAndDrained(t *testing.T) {
 	// nothing says what a job left there before the restart.
 	if second.f.indexOf("pkill -KILL -U 655") < 0 || second.f.indexOf("createhomedir -c -u zj05") < 0 {
 		t.Errorf("the free account above capacity was not cleaned: %v", second.f.logged())
-	}
-	// Every account that exists is in the firewall, the running jobs' included.
-	for n := 1; n <= 5; n++ {
-		if !strings.Contains(second.f.pfRules, jobUserName(n)) {
-			t.Errorf("the anchor does not name %s: %s", jobUserName(n), second.f.pfRules)
-		}
 	}
 
 	// The jobs in the drained slots end: each slot is cleaned, and never offered.

@@ -277,20 +277,17 @@ Every clone inherits the template's account password, so do not reuse it. See
 ### A Mac running jobs as job users
 
 On a Mac enrolled for [job-user isolation](macos-job-users.md), each job runs
-natively as a local account of its own whose home is wiped afterwards. This is
-weaker than a VM, and is meant for your own private repositories' CI: it keeps the
-agent's secrets out of reach and removes a job's leftovers, but it does not stop a
-kernel or set-user-ID exploit, and it puts no limit on CPU, memory or disk.
+natively as a local account of its own whose home is wiped afterwards. This gives
+each job a clean account and keeps the jobs and the agent's secrets apart. **It
+does not restrict the network at all**: a job can reach the LAN and anything else
+the Mac can reach. Use it only for trusted private repositories. It does not stop
+a kernel or set-user-ID exploit, and it puts no limit on CPU, memory or disk.
 
-* **The agent runs as root**, so that it can start each job as its account and
-  write the firewall rules. It makes only outbound connections and has no
-  listener. Its configuration, state and work folder are root's and closed to
-  everyone else, and it refuses to start if they are not, or if its binary or a
-  folder above it could be replaced by anyone but root.
-* **Zoomies edits pf in this mode, and only its own anchor**, `com.apple/zoomies-job-users`,
-  whose rules match only the job accounts. Until now it checked a host's firewall
-  and never wrote one. It compares the loaded rules before every job and every
-  sixty seconds, and a lost firewall stops every job and holds the host.
+* **The agent runs as root**, so that it can start each job as its account. It
+  makes only outbound connections and has no listener. Its configuration, state
+  and work folder are root's and closed to everyone else, and it refuses to start
+  if they are not, or if its binary or a folder above it could be replaced by
+  anyone but root.
 * **Nothing secret may be world-readable** on the host, because a job can read
   what the world can.
 * **Use it only for runner groups that do not allow public repositories.**

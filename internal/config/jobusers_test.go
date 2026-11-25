@@ -1,8 +1,6 @@
 package config
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -16,10 +14,6 @@ func jobUsersReady() *Config {
 	c.Agent.Backend = "process"
 	c.Agent.Capacity = 4
 	c.Agent.FinishedRetention = 0
-	c.Agent.JobUsers = JobUsersConfig{
-		EgressMustAllow: []string{"github.com:443"},
-		EgressMustBlock: []string{"198.51.100.10:443", "203.0.113.7:22"},
-	}
 	c.Note("agent.process_isolation", SourceFile)
 	return c
 }
@@ -79,37 +73,6 @@ func TestJobUsersIsRefusedWithAFinishedRetention(t *testing.T) {
 	}
 }
 
-func TestJobUsersIsRefusedWithoutBothEgressLists(t *testing.T) {
-	cases := map[string]struct {
-		change  func(*JobUsersConfig)
-		setting string
-	}{
-		"no allow list":           {func(j *JobUsersConfig) { j.EgressMustAllow = nil }, "agent.job_users.egress_must_allow"},
-		"no block list":           {func(j *JobUsersConfig) { j.EgressMustBlock = nil }, "agent.job_users.egress_must_block"},
-		"an allow target no port": {func(j *JobUsersConfig) { j.EgressMustAllow = []string{"github.com"} }, "agent.job_users.egress_must_allow"},
-		"a block target by name":  {func(j *JobUsersConfig) { j.EgressMustBlock = []string{"example.com:443"} }, "agent.job_users.egress_must_block"},
-		"an IPv6 block target":    {func(j *JobUsersConfig) { j.EgressMustBlock = []string{"[2001:db8::1]:443"} }, "agent.job_users.egress_must_block"},
-		"a loopback block target": {func(j *JobUsersConfig) { j.EgressMustBlock = []string{"127.0.0.1:22"} }, "agent.job_users.egress_must_block"},
-		"an IPv6 allow target":    {func(j *JobUsersConfig) { j.EgressMustAllow = []string{"[2001:db8::1]:443"} }, "agent.job_users.egress_must_allow"},
-		"more than eight in total": {func(j *JobUsersConfig) {
-			j.EgressMustBlock = []string{"198.51.100.1:1", "198.51.100.2:1", "198.51.100.3:1", "198.51.100.4:1", "198.51.100.5:1", "198.51.100.6:1", "198.51.100.7:1", "198.51.100.8:1"}
-		}, "agent.job_users.egress_must_allow"},
-	}
-	for name, tc := range cases {
-		c := jobUsersReady()
-		tc.change(&c.Agent.JobUsers)
-		found := false
-		for _, f := range jobUsersFindings(c, "darwin") {
-			if f.Code == "agent.job_users_invalid" && f.Setting == tc.setting && f.Severity == SeverityError && f.Fix != "" {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("%s: no agent.job_users_invalid naming %s", name, tc.setting)
-		}
-	}
-}
-
 func TestJobUsersIsRefusedWithACapacityOver47(t *testing.T) {
 	c := jobUsersReady()
 	c.Agent.Capacity = MaxJobUsersCapacity + 1
@@ -166,52 +129,12 @@ func TestJobUsersIsAProcessIsolationChoiceTheRemoteMacRuleKnows(t *testing.T) {
 	}
 }
 
-func TestLoadJobUsersFileIsStrict(t *testing.T) {
-	dir := t.TempDir()
-	write := func(body string) string {
-		p := filepath.Join(dir, "job-users.yaml")
-		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
-	got, err := LoadJobUsersFile(write("agent:\n  job_users:\n    egress_must_allow: [\"github.com:443\"]\n    egress_must_block: [\"198.51.100.10:443\"]\n"))
-	if err != nil || len(got.EgressMustAllow) != 1 || got.EgressMustBlock[0] != "198.51.100.10:443" {
-		t.Fatalf("got %+v, %v", got, err)
-	}
-	for name, body := range map[string]string{
-		"a misspelt key":  "agent:\n  job_users:\n    egress_must_alow: [x]\n",
-		"another section": "agent:\n  capacity: 4\n",
-		"two documents":   "agent:\n  job_users: {}\n---\nagent: {}\n",
-		"nothing":         "",
-	} {
-		if _, err := LoadJobUsersFile(write(body)); err == nil {
-			t.Errorf("%s was accepted", name)
-		}
-	}
-	if _, err := LoadJobUsersFile(filepath.Join(dir, "missing.yaml")); err == nil {
-		t.Error("a missing file was accepted")
-	}
-}
-
-func TestJobUsersSettingsAreInTheRegistryAndTheEnvironment(t *testing.T) {
-	t.Setenv("ZOOMIES_AGENT_JOB_USERS_EGRESS_MUST_ALLOW", "github.com:443")
-	c, err := Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(c.Agent.JobUsers.EgressMustAllow) != 1 || c.Agent.JobUsers.EgressMustAllow[0] != "github.com:443" {
-		t.Errorf("job_users.egress_must_allow = %v", c.Agent.JobUsers.EgressMustAllow)
-	}
-	for _, key := range []string{"agent.job_users.egress_must_allow", "agent.job_users.egress_must_block"} {
-		found := false
-		for _, s := range Settings() {
-			if s.Key == key && s.Scope == ScopeLocal {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("%s is not a local setting in the registry", key)
+// The mode takes no settings of its own: it restricts no network traffic, so
+// there is no list of targets to check, and agent.capacity is the only dial.
+func TestJobUsersHasNoSettingsOfItsOwn(t *testing.T) {
+	for _, s := range Settings() {
+		if strings.HasPrefix(s.Key, "agent.job_users") {
+			t.Errorf("%s is a setting; job users are chosen with agent.process_isolation and sized with agent.capacity", s.Key)
 		}
 	}
 }

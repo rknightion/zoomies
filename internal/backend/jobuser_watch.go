@@ -8,11 +8,12 @@ import (
 	"time"
 )
 
-// jobUserWatchEvery is how often the watcher looks at the firewall.
+// jobUserWatchEvery is how often the watcher looks at the slots and the trash.
 const jobUserWatchEvery = 60 * time.Second
 
 // startWatch starts the one background goroutine job users have. It runs outside
-// every create, so a firewall that is lost is noticed while no job is starting.
+// every create, so a slot that could not be cleaned is tried again, and the trash
+// emptied, while no job is starting.
 func (u *jobUsers) startWatch(parent context.Context) {
 	ctx, cancel := context.WithCancel(parent)
 	u.cancel = cancel
@@ -41,31 +42,10 @@ func (u *jobUsers) close() {
 	u.watchWG.Wait()
 }
 
-// watchOnce is one pass: the firewall, the slots that need another try, and the
-// trash.
+// watchOnce is one pass: the slots that need another try, and the trash.
 func (u *jobUsers) watchOnce(ctx context.Context) {
-	if err := u.pf.verify(ctx); err != nil {
-		u.firewallLost(ctx, err)
-	}
 	u.retryUnhealthy(ctx)
 	u.sweepTrash(ctx)
-}
-
-// firewallLost is the incident the watcher exists for: the anchor is missing, or
-// pf is off, or the rules are not the ones loaded. It reloads the anchor, stops
-// every job's processes so that their runners exit through the normal path, and
-// holds the host, so a lost firewall is a visible incident and not a silent gap.
-func (u *jobUsers) firewallLost(ctx context.Context, cause error) {
-	reason := fmt.Sprintf("the firewall for job users was lost or changed, so every running job was stopped: %v", cause)
-	if err := u.pf.load(ctx); err != nil {
-		reason += fmt.Sprintf("; reloading it failed too: %v", err)
-	} else {
-		reason += "; it has been loaded again"
-	}
-	u.log.Error("the job users' firewall was lost", "reason", reason)
-	u.state.startHold(vmpalEgressHold, reason)
-	u.reprobe.Store(true)
-	u.stopAllSlots(ctx)
 }
 
 // retryUnhealthy tries again every slot whose time has come. The schedule is the

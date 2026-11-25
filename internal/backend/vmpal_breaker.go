@@ -83,9 +83,6 @@ type vmpalHostState struct {
 	now  func() time.Time
 	log  *slog.Logger
 	file vmpalHostFile
-	// heldErr is what a refusal wraps. Job users give their own, so that the
-	// message does not talk about VMs.
-	heldErr error
 }
 
 // openVMPalHostState loads state.json. A file that cannot be believed starts a
@@ -137,11 +134,7 @@ func (s *vmpalHostState) held() error {
 	if !s.clock().Before(s.file.HoldUntil) {
 		return nil
 	}
-	refusal := s.heldErr
-	if refusal == nil {
-		refusal = errVMPalHeld
-	}
-	return fmt.Errorf("%w: held until %s: %s", refusal, s.file.HoldUntil.UTC().Format(time.RFC3339), s.file.HoldReason)
+	return fmt.Errorf("%w: held until %s: %s", errVMPalHeld, s.file.HoldUntil.UTC().Format(time.RFC3339), s.file.HoldReason)
 }
 
 // startHold holds new work for d from now.

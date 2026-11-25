@@ -10,50 +10,12 @@ import (
 	"time"
 )
 
-func TestWatchReloadsAMissingAnchorAndHoldsTheHost(t *testing.T) {
-	x := startedJobUserFixture(t, 1)
-	x.f.procs = []jobUserProc{{PID: 500, RUID: 651, EUID: 651}, {PID: 501, RUID: 652, EUID: 652}}
-	// Something flushed the anchor while jobs were running.
-	x.f.pfRules = ""
-
-	x.u.watchOnce(context.Background())
-
-	if x.f.indexOf("pfctl -a "+jobUserAnchor+" -f -") < 0 || x.f.pfRules == "" {
-		t.Errorf("the anchor was not loaded again: %v", x.f.logged())
-	}
-	if len(x.f.procs) != 0 {
-		t.Errorf("%d job processes were left running with no firewall", len(x.f.procs))
-	}
-	held := x.u.state.held()
-	if !errors.Is(held, errJobUsersHeld) || !strings.Contains(held.Error(), "firewall") {
-		t.Fatalf("held = %v; want a hold that says the firewall was lost", held)
-	}
-	if !x.b.ProbeStale() {
-		t.Error("the Hosts page is not told to look again")
-	}
-	if info := x.b.Probe(context.Background()); info.Available || !strings.Contains(info.Detail, "firewall") {
-		t.Errorf("Probe = %+v; want the host unavailable and saying why", info)
-	}
-	// Nobody is started while it is held.
-	_, err := x.b.CreateWithResult(context.Background(), jobUserSpec("runner-held"))
-	if !errors.Is(err, errJobUsersHeld) {
-		t.Errorf("create while held = %v", err)
-	}
-
-	// The incident is one incident: with the anchor back, the next pass is quiet.
-	x.f.reset()
-	x.u.watchOnce(context.Background())
-	if x.f.count("pkill") != 0 {
-		t.Error("jobs were stopped a second time for the same loss")
-	}
-}
-
 func TestWatchLeavesAHealthyHostAlone(t *testing.T) {
 	x := startedJobUserFixture(t, 1)
 	x.f.procs = []jobUserProc{{PID: 500, RUID: 651, EUID: 651}}
 	x.u.watchOnce(context.Background())
-	if len(x.f.procs) != 1 || x.u.state.held() != nil {
-		t.Errorf("a host with its firewall in place was disturbed: held=%v procs=%v", x.u.state.held(), x.f.procs)
+	if len(x.f.procs) != 1 || x.f.count("pkill") != 0 {
+		t.Errorf("a host with nothing wrong was disturbed: procs=%v, log=%v", x.f.procs, x.f.logged())
 	}
 }
 
@@ -206,14 +168,13 @@ func TestTheWatcherRunsUntilTheBackendIsClosed(t *testing.T) {
 	if err := x.b.StartJobUsers(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// Flushed behind its back, it is found by the ticker and not by a test.
-	x.f.mu.Lock()
-	x.f.pfRules = ""
-	x.f.mu.Unlock()
+	// A slot that failed is found by the ticker and retried, not by a test.
+	x.u.markUnhealthy(x.u.slotNamed("zj01"), errors.New("boom"))
+	x.f.advance(time.Hour)
 	deadline := time.Now().Add(5 * time.Second)
-	for x.u.state.held() == nil {
+	for x.u.healthyCount() != 2 {
 		if time.Now().After(deadline) {
-			t.Fatal("the watcher never noticed the lost anchor")
+			t.Fatal("the watcher never retried the slot that was out of service")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

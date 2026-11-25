@@ -449,8 +449,6 @@ settings page reports rather than refusing the edit.
 | `agent.vmpal.policy_check` | `ZOOMIES_AGENT_VMPAL_POLICY_CHECK` | on the agent's own host | VMPal policy check: The absolute path of the command that attests this Mac's firewall policy. Required with vmpal isolation. |
 | `agent.vmpal.egress_must_allow` | `ZOOMIES_AGENT_VMPAL_EGRESS_MUST_ALLOW` | on the agent's own host | VMPal egress that must work: The host:port targets a clone must reach before it is given a credential. Required with vmpal isolation. |
 | `agent.vmpal.egress_must_block` | `ZOOMIES_AGENT_VMPAL_EGRESS_MUST_BLOCK` | on the agent's own host | VMPal egress that must fail: The IP-literal host:port targets a clone must not reach before it is given a credential. Required with vmpal isolation. |
-| `agent.job_users.egress_must_allow` | `ZOOMIES_AGENT_JOB_USERS_EGRESS_MUST_ALLOW` | on the agent's own host | Job users egress that must work: The host:port targets a job user must reach before each job. Required with user isolation. |
-| `agent.job_users.egress_must_block` | `ZOOMIES_AGENT_JOB_USERS_EGRESS_MUST_BLOCK` | on the agent's own host | Job users egress that must fail: The IPv4-literal host:port targets a job user must not reach before each job. Required with user isolation. |
 
 ### `assistant`
 

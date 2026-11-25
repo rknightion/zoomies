@@ -290,8 +290,8 @@ procedure and what the Mac's firewall must guarantee.
 A Mac can instead run each job natively as a local account of its own, with its
 home wiped afterwards, at a job count you set. That host offers the `process`
 backend too, carries the label `isolation=user` and is selected with a
-`host_selector` of that label; it is weaker than a VM, and
-[macOS runners as job users](macos-job-users.md) says by how much.
+`host_selector` of that label; it is weaker than a VM and restricts no network traffic, and
+[macOS runners as job users](macos-job-users.md) says what it does.
 
 ### What a host brings with it
 

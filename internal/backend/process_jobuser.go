@@ -41,16 +41,14 @@ func (b *ProcessBackend) SlotSized() bool { return b.jobUsers != nil }
 
 var _ ProbeInvalidator = (*ProcessBackend)(nil)
 
-// ProbeStale says the last Probe no longer describes this host: a hold started
-// or ended, or a slot changed health. It clears on read.
+// ProbeStale says the last Probe no longer describes this host: a slot changed
+// health. It clears on read.
 func (b *ProcessBackend) ProbeStale() bool {
 	u := b.jobUsers
 	if u == nil {
 		return false
 	}
-	held := u.state.held() != nil
-	changed := u.probedHeld.Swap(held) != held
-	return u.reprobe.Swap(false) || changed
+	return u.reprobe.Swap(false)
 }
 
 // Close stops the watcher. It leaves every runner running.
@@ -61,11 +59,9 @@ func (b *ProcessBackend) Close() {
 }
 
 // StartJobUsers makes the accounts, finds the jobs an earlier agent left, cleans
-// every slot nobody holds, loads the firewall and starts the watcher. Nothing
-// is admitted before it returns. It refuses to go on if an account or the group
-// is not what Zoomies would have made, and holds the host, without refusing to
-// start, if the firewall could not be loaded: running jobs are not in this
-// agent's way, and a held host says why on the Hosts page.
+// every slot nobody holds and starts the watcher. Nothing is admitted before it
+// returns. It refuses to go on if an account or the group is not what Zoomies
+// would have made.
 func (b *ProcessBackend) StartJobUsers(ctx context.Context) error {
 	u := b.jobUsers
 	if u == nil {
@@ -96,11 +92,6 @@ func (b *ProcessBackend) StartJobUsers(ctx context.Context) error {
 		if err := u.resetSlot(ctx, s); err != nil {
 			u.markUnhealthy(s, err)
 		}
-	}
-	if err := u.pf.load(ctx); err != nil {
-		reason := fmt.Sprintf("the firewall for job users could not be loaded: %v", err)
-		u.state.startHold(vmpalEgressHold, reason)
-		u.log.Error("the job users' firewall could not be loaded, so the host is held", "error", err)
 	}
 	u.startWatch(context.WithoutCancel(ctx))
 	u.started.Store(true)
@@ -227,12 +218,6 @@ func (b *ProcessBackend) probeJobUsers(ctx context.Context) Info {
 		info.Detail = "the job users have not been set up yet; the agent makes them when it starts"
 		return info
 	}
-	held := u.state.held()
-	u.probedHeld.Store(held != nil)
-	if held != nil {
-		info.Detail = strings.TrimPrefix(held.Error(), "backend: ")
-		return info
-	}
 	if u.healthyCount() == 0 {
 		info.Detail = "no job user can take a job: " + strings.Join(u.unhealthy(), "; ")
 		return info
@@ -308,7 +293,10 @@ func (b *ProcessBackend) createJobUser(ctx context.Context, spec Spec, started t
 	// The registration is in the environment only, as in the plain backend, and
 	// never touches disk.
 	env := jobUserEnv(slot, u.home(slot), tmp, spec)
-	if err := b.startAdmitted(dir, runDir, slot, env, spec, version); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return CreateResult{}, fmt.Errorf("backend: creating the runner record %s: %w", dir, err)
+	}
+	if err := b.startRunner(dir, runDir, slot, []string{"run"}, env, spec, version); err != nil {
 		_ = os.RemoveAll(dir)
 		return CreateResult{}, err
 	}
@@ -317,41 +305,9 @@ func (b *ProcessBackend) createJobUser(ctx context.Context, spec Spec, started t
 	return CreateResult{Handle: Handle(dir), CreateDuration: time.Since(started)}, nil
 }
 
-// startAdmitted makes the runner's record and starts the runner, after one last
-// look at whether the host was held or every job was stopped since this create
-// was admitted. The look and the start are under one lock, which stopping every
-// job takes too: a runner that is started before the stop is killed by it, and
-// one that would start after it is not started, so a create that passed its
-// firewall check a moment before the firewall was found lost cannot run
-// unwatched until the next pass.
-func (b *ProcessBackend) startAdmitted(dir, runDir string, slot *jobUserSlot, env []string, spec Spec, version string) error {
-	u := b.jobUsers
-	u.startMu.RLock()
-	defer u.startMu.RUnlock()
-	if err := u.state.held(); err != nil {
-		return err
-	}
-	if u.stopGen != slot.admitGen {
-		return fmt.Errorf("%w: every job on this Mac was stopped while this runner was being made, so it was not started", errJobUsersHeld)
-	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return fmt.Errorf("backend: creating the runner record %s: %w", dir, err)
-	}
-	return b.startRunner(dir, runDir, slot, []string{"run"}, env, spec, version)
-}
-
-// admit reserves a slot and proves the host is fit to run a job in it: the slot
-// is clean, the firewall is in force and the egress check passes as that
-// account. A slot that cannot be cleaned is taken out of service and the next is
-// tried; a firewall that fails holds the whole host. It records the stop count it
-// began under in the slot, for startAdmitted to compare.
+// admit reserves a slot and proves it is clean. A slot that cannot be cleaned is
+// taken out of service and the next is tried.
 func (u *jobUsers) admit(ctx context.Context, holder string) (*jobUserSlot, error) {
-	u.startMu.RLock()
-	gen := u.stopGen
-	u.startMu.RUnlock()
-	if err := u.state.held(); err != nil {
-		return nil, err
-	}
 	for {
 		s, err := u.reserve(holder)
 		if err != nil {
@@ -361,16 +317,6 @@ func (u *jobUsers) admit(ctx context.Context, holder string) (*jobUserSlot, erro
 			u.markUnhealthy(s, err)
 			continue
 		}
-		if err := u.pf.verify(ctx); err != nil {
-			u.release(s)
-			u.firewallLost(ctx, err)
-			return nil, u.state.held()
-		}
-		if err := u.checkEgress(ctx, s); err != nil {
-			u.release(s)
-			return nil, err
-		}
-		s.admitGen = gen
 		return s, nil
 	}
 }
