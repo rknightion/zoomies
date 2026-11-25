@@ -555,8 +555,8 @@ func (u *jobUsers) ensureManifest(s *jobUserSlot) error {
 }
 
 // verifySlot is the cheap check before a job, and the end of a reset: no
-// process has the slot's UID, and the home holds exactly what the manifest says
-// a fresh one does.
+// process has the slot's UID, and the home holds nothing the manifest of a fresh
+// one does not.
 func (u *jobUsers) verifySlot(ctx context.Context, s *jobUserSlot) error {
 	procs, err := u.processesOf(ctx, s.uid)
 	if err != nil {
@@ -573,34 +573,30 @@ func (u *jobUsers) verifySlot(ctx context.Context, s *jobUserSlot) error {
 	if err != nil {
 		return fmt.Errorf("listing the home of %s: %w", s.name, err)
 	}
-	if got != string(want) {
-		return fmt.Errorf("the home of %s is not what a fresh one is: %s", s.name, firstListingDifference(string(want), got))
+	if extra := entryNotInManifest(string(want), got); extra != "" {
+		return fmt.Errorf("the home of %s is not what a fresh one is: %q is there and the manifest does not have it", s.name, extra)
 	}
 	return nil
 }
 
-// firstListingDifference says what differs first, so the operator is told which
-// file a job left rather than that something did.
-func firstListingDifference(want, got string) string {
+// entryNotInManifest returns the first entry of the home that the manifest of a
+// fresh one does not have, so the operator is told which file a job left. An
+// entry whose type, permissions or owner changed shows here too. Something in
+// the manifest that the home lacks is not reported: macOS sometimes adds
+// Library/Preferences/ByHost just after createhomedir, so the manifest can hold
+// a folder a later fresh home does not, and a missing folder is not a job's
+// leftover.
+func entryNotInManifest(want, got string) string {
 	have := map[string]bool{}
 	for _, l := range strings.Split(want, "\n") {
 		have[l] = true
 	}
 	for _, l := range strings.Split(got, "\n") {
 		if l != "" && !have[l] {
-			return fmt.Sprintf("%q is there and the manifest does not have it", l)
+			return l
 		}
 	}
-	in := map[string]bool{}
-	for _, l := range strings.Split(got, "\n") {
-		in[l] = true
-	}
-	for _, l := range strings.Split(want, "\n") {
-		if l != "" && !in[l] {
-			return fmt.Sprintf("%q is missing", l)
-		}
-	}
-	return "its entries are in another order"
+	return ""
 }
 
 // ensureClean is what a slot goes through before a job: the cheap check, and the

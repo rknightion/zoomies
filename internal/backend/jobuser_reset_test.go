@@ -168,7 +168,7 @@ func TestVerifyFailsWhenTheHomeDiffersFromItsManifest(t *testing.T) {
 		"a file left in the home": func() error { return os.WriteFile(filepath.Join(home, ".bash_profile"), nil, 0o600) },
 		"a file deeper down":      func() error { return os.WriteFile(filepath.Join(home, "Library", "LaunchAgents.plist"), nil, 0o600) },
 		"a link":                  func() error { return os.Symlink("/etc", filepath.Join(home, "etc")) },
-		"a file that was removed": func() error { return os.Remove(filepath.Join(home, "Documents")) },
+		"a folder opened up":      func() error { return os.Chmod(filepath.Join(home, "Documents"), 0o755) },
 	}
 	for name, change := range cases {
 		if err := x.u.resetSlot(context.Background(), s); err != nil {
@@ -180,6 +180,21 @@ func TestVerifyFailsWhenTheHomeDiffersFromItsManifest(t *testing.T) {
 		if err := x.u.verifySlot(context.Background(), s); err == nil || !strings.Contains(err.Error(), "not what a fresh one is") {
 			t.Errorf("%s: verify = %v; want it to refuse the home", name, err)
 		}
+	}
+}
+
+func TestVerifyAcceptsAHomeMissingSomethingTheManifestHas(t *testing.T) {
+	// macOS sometimes adds Library/Preferences/ByHost to a home just after
+	// createhomedir makes it, so the manifest can hold a folder a later fresh
+	// home lacks. Something missing is not something a job left, and refusing it
+	// took every job user out of service on a real Mac.
+	x := startedJobUserFixture(t, 1)
+	s := x.u.slotNamed("zj01")
+	if err := os.Remove(filepath.Join(x.f.usersDir, "zj01", "Documents")); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.u.verifySlot(context.Background(), s); err != nil {
+		t.Errorf("a home missing a folder the manifest has was refused: %v", err)
 	}
 }
 
