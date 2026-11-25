@@ -45,7 +45,9 @@ type fakeJobUsers struct {
 	rules     []fakeRule
 	owners    map[string][2]int
 	// lstat answers for paths that cannot exist on the machine the test runs on.
-	lstat   map[string]fs.FileInfo
+	lstat map[string]fs.FileInfo
+	// readDir answers for folders that cannot exist on the machine the test runs on.
+	readDir map[string][]fs.DirEntry
 	ipcs    string
 	findOut string
 	// tempDir is what getconf prints.
@@ -91,6 +93,7 @@ func newFakeJobUsers(t *testing.T) *fakeJobUsers {
 		devs:     map[string]uint64{},
 		owners:   map[string][2]int{},
 		lstat:    map[string]fs.FileInfo{},
+		readDir:  map[string][]fs.DirEntry{},
 		tempDir:  "/var/folders/ab/cdef12/T/",
 		clock:    time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC),
 	}
@@ -412,6 +415,12 @@ func (f *fakeJobUsers) Lstat(path string) (fs.FileInfo, error) {
 	return os.Lstat(path)
 }
 func (f *fakeJobUsers) ReadDir(path string) ([]fs.DirEntry, error) {
+	f.mu.Lock()
+	entries, ok := f.readDir[path]
+	f.mu.Unlock()
+	if ok {
+		return entries, nil
+	}
 	return os.ReadDir(path)
 }
 func (f *fakeJobUsers) Rename(oldPath, newPath string) error {

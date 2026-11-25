@@ -286,10 +286,13 @@ func (u *jobUsers) replaceHome(ctx context.Context, s *jobUserSlot) error {
 // folders below /var/folders, the last of them T.
 var userTempDir = regexp.MustCompile(`^((?:/private)?/var/folders/[A-Za-z0-9_]{2}/[A-Za-z0-9_]+)/T/?$`)
 
-// removeUserTemp removes the folder macOS keeps the user's temporary and cache
+// removeUserTemp empties the folder macOS keeps the user's temporary and cache
 // files in. Its place is asked of the system, as the slot user, because it is
 // derived from the UID and not a name; what comes back is held to the exact
-// shape before anything is removed as root.
+// shape before anything is removed as root. The folder, and the 0, C, T and X
+// folders macOS makes in it, carry the sunlnk flag, which stops even root
+// unlinking them: removing the folder whole fails every reset and takes the slot
+// out of service, so what goes is what is inside each of them.
 func (u *jobUsers) removeUserTemp(ctx context.Context, s *jobUserSlot) error {
 	dir, err := u.userTempDir(ctx, s)
 	if err != nil {
@@ -310,7 +313,29 @@ func (u *jobUsers) removeUserTemp(ctx context.Context, s *jobUserSlot) error {
 	if uid, _, ok := u.sys.Owner(parent, info); !ok || uid != s.uid {
 		return fmt.Errorf("%s is not owned by %s (UID %d), so it is not removed", parent, s.name, s.uid)
 	}
-	return u.sys.RemoveAll(parent)
+	children, err := u.sys.ReadDir(parent)
+	if err != nil {
+		return err
+	}
+	for _, c := range children {
+		child := filepath.Join(parent, c.Name())
+		if !c.IsDir() {
+			if err := u.sys.RemoveAll(child); err != nil {
+				return err
+			}
+			continue
+		}
+		inside, err := u.sys.ReadDir(child)
+		if err != nil {
+			return err
+		}
+		for _, e := range inside {
+			if err := u.sys.RemoveAll(filepath.Join(child, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // userTempDir asks the system, as the slot user, for its temporary folder.

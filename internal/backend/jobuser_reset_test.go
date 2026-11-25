@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -219,20 +220,35 @@ func TestResetRefusesATemporaryFolderOfTheWrongShapeBeforeRemovingAnything(t *te
 	}
 }
 
-func TestResetRemovesTheTemporaryFolderOnlyWhenTheSlotOwnsIt(t *testing.T) {
+func TestResetEmptiesTheTemporaryFolderOnlyWhenTheSlotOwnsIt(t *testing.T) {
 	x := startedJobUserFixture(t, 1)
 	parent := "/var/folders/ab/cdef12"
-	info, err := os.Lstat(t.TempDir())
+	dir, err := os.Lstat(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	x.f.lstat[parent] = info
+	stray, err := os.Lstat(filepath.Join(t.TempDir(), "."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.f.lstat[parent] = dir
+	entry := func(name string, isDir bool) fs.DirEntry {
+		if isDir {
+			return fs.FileInfoToDirEntry(namedInfo{dir, name})
+		}
+		return fs.FileInfoToDirEntry(namedInfo{fileInfo{stray}, name})
+	}
+	x.f.readDir[parent] = []fs.DirEntry{entry("0", true), entry("C", true), entry("T", true), entry("X", true), entry("stray", false)}
+	x.f.readDir[parent+"/T"] = []fs.DirEntry{entry("build.o", false)}
+	x.f.readDir[parent+"/C"] = []fs.DirEntry{entry("clang", true)}
+	x.f.readDir[parent+"/0"] = nil
+	x.f.readDir[parent+"/X"] = nil
 	s := x.u.slotNamed("zj01")
 
-	// Somebody else's folder with a name of the right shape is not removed.
+	// Somebody else's folder with a name of the right shape is not touched.
 	x.f.owners[parent] = [2]int{0, 0}
 	if err := x.u.removeUserTemp(context.Background(), s); err == nil {
-		t.Error("a folder root owns was removed on the strength of its name")
+		t.Error("a folder root owns was emptied on the strength of its name")
 	}
 	if x.f.count("removeall") != 0 {
 		t.Errorf("something was removed: %v", x.f.logged())
@@ -242,14 +258,41 @@ func TestResetRemovesTheTemporaryFolderOnlyWhenTheSlotOwnsIt(t *testing.T) {
 	if err := x.u.removeUserTemp(context.Background(), s); err != nil {
 		t.Fatal(err)
 	}
-	if x.f.indexOf("removeall "+parent) < 0 {
-		t.Errorf("the slot's own folder was left: %v", x.f.logged())
+	removed := map[string]bool{}
+	for _, line := range x.f.logged() {
+		if p, ok := strings.CutPrefix(line, "removeall "); ok {
+			removed[p] = true
+		}
 	}
-	// It is the parent of T that goes, with the cache and the zero folder beside it.
-	if x.f.indexOf("removeall "+parent+"/T") >= 0 {
-		t.Error("only T was removed")
+	for _, gone := range []string{parent + "/T/build.o", parent + "/C/clang", parent + "/stray"} {
+		if !removed[gone] {
+			t.Errorf("%s was left: %v", gone, x.f.logged())
+		}
+	}
+	// macOS makes the folder and the four inside it with the sunlnk flag, which
+	// stops even root unlinking them, so removing any of them fails the reset
+	// and takes the slot out of service. They stay, empty.
+	for _, kept := range []string{parent, parent + "/0", parent + "/C", parent + "/T", parent + "/X"} {
+		if removed[kept] {
+			t.Errorf("%s was removed, which macOS refuses: %v", kept, x.f.logged())
+		}
 	}
 }
+
+// namedInfo gives a real file's description another name, for a folder the
+// test describes rather than makes.
+type namedInfo struct {
+	fs.FileInfo
+	name string
+}
+
+func (n namedInfo) Name() string { return n.name }
+
+// fileInfo is a description that says it is not a folder.
+type fileInfo struct{ fs.FileInfo }
+
+func (fileInfo) IsDir() bool       { return false }
+func (fileInfo) Mode() fs.FileMode { return 0o644 }
 
 func TestResetRemovesOnlyTheIPCObjectsTheSlotOwns(t *testing.T) {
 	out := `IPC status from <running system> as of Wed Nov 25 12:00:00 UTC 2026
