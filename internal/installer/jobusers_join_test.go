@@ -76,6 +76,24 @@ func TestTheLaunchdPlistCarriesTheEnvironmentOfARootAgent(t *testing.T) {
 	}
 }
 
+func TestTheLaunchdPlistRunsTheServiceAtNormalPriority(t *testing.T) {
+	// launchd gives a Background job, and every process it starts, the lowest
+	// CPU and I/O priority, which on Apple silicon keeps it on the efficiency
+	// cores. An agent's jobs are its children, so a Swift build that took five
+	// minutes in a VM took over twenty as a job user, at priority 4 against 31.
+	spec := ServiceSpec{
+		Unit: UnitAgent, ExecPath: "/usr/local/bin/zoomies", ConfigFile: JobUsersSupportDir + "/zoomies.yaml",
+		User: "root", Group: "wheel", StateDir: JobUsersSupportDir,
+	}
+	got, err := RenderLaunchdPlist(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "<key>ProcessType</key>\n\t<string>Standard</string>") {
+		t.Errorf("the plist does not ask for normal priority:\n%s", got)
+	}
+}
+
 func TestTheRootDaemonsPlistIsWrittenWhereLaunchdLoadsDaemons(t *testing.T) {
 	if got := LaunchdPlistPath("sh.zoomies.agent", true); got != "/Library/LaunchDaemons/sh.zoomies.agent.plist" {
 		t.Errorf("plist path = %s", got)
