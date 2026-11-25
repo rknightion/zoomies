@@ -13,21 +13,23 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
 
-// jobUserBlockedV4 and jobUserBlockedV6 are the private ranges a job may not
-// reach: the LAN, the tailnet (100.64.0.0/10 and its IPv6 range inside fc00::/7)
-// and link-local addresses.
-const (
-	jobUserBlockedV4 = "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16"
-	jobUserBlockedV6 = "fc00::/7, fe80::/10"
-)
+// jobUserBlockedV4 is the private ranges a job may not reach over IPv4: the LAN,
+// the tailnet (100.64.0.0/10) and link-local addresses. IPv6 has no such list,
+// because on a dual-stack LAN every other host has a global address as well, which
+// no list of private ranges would cover: a job user gets no IPv6 beyond loopback,
+// and keeps the IPv4 internet.
+const jobUserBlockedV4 = "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16"
 
 var pfInterfaceName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
 
-// renderJobUserAnchor is the text of the anchor. The third rule blocks the host's
+// renderJobUserAnchor is the text of the anchor. The second blocks all IPv6 but
+// ::1, so that a job can still reach its own servers on loopback. The third rule
+// blocks the host's
 // own addresses on every interface but loopback, written as (name) so that pf
 // follows an address that changes, because a job that could reach the host's
 // public address would reach its services as the host. Loopback stays open: a
@@ -45,7 +47,7 @@ func renderJobUserAnchor(users []string, ifaces []jobUserIface) string {
 	sort.Strings(names)
 	var b strings.Builder
 	fmt.Fprintf(&b, "block drop out quick inet from any to { %s } %s\n", jobUserBlockedV4, who)
-	fmt.Fprintf(&b, "block drop out quick inet6 from any to { %s } %s\n", jobUserBlockedV6, who)
+	fmt.Fprintf(&b, "block drop out quick inet6 from any to ! ::1 %s\n", who)
 	if len(names) > 0 {
 		fmt.Fprintf(&b, "block drop out quick from any to { %s } %s\n", strings.Join(names, ", "), who)
 	}
@@ -70,8 +72,11 @@ func (p *jobUserPF) text() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("listing the network interfaces: %w", err)
 	}
+	// Every account that exists, and not only those offered to new jobs: a job
+	// that survived a restart can be running as one the capacity no longer offers,
+	// and it needs the same rules.
 	var users []string
-	for _, s := range p.u.offered() {
+	for _, s := range p.u.covered() {
 		users = append(users, s.name)
 	}
 	return renderJobUserAnchor(users, ifaces), nil
@@ -114,12 +119,17 @@ func (p *jobUserPF) loadLocked(ctx context.Context) error {
 }
 
 // enable turns pf on and keeps the one reference it gives. The one an earlier
-// run of the agent took is released first, so restarts do not pile references up
-// and keep pf on after the agent is uninstalled.
+// run of the agent took is released, so restarts do not pile references up and
+// keep pf on after the agent is uninstalled, but only once the new one is taken
+// and written down: released first, pf would be off between the two whenever the
+// old reference was the only one, and the firewall would be down in that gap.
 func (p *jobUserPF) enable(ctx context.Context) error {
-	if old, err := os.ReadFile(p.tokenPath()); err == nil {
-		if tok := strings.TrimSpace(string(old)); tok != "" {
-			_, _ = p.u.sys.Run(ctx, jobUserCommand{Argv: []string{"/sbin/pfctl", "-X", tok}})
+	old := ""
+	if b, err := os.ReadFile(p.tokenPath()); err == nil {
+		if tok := strings.TrimSpace(string(b)); tok != "" {
+			if _, err := strconv.Atoi(tok); err == nil {
+				old = tok
+			}
 		}
 	}
 	res, err := p.u.sys.Run(ctx, jobUserCommand{Argv: []string{"/sbin/pfctl", "-E"}})
@@ -133,10 +143,22 @@ func (p *jobUserPF) enable(ctx context.Context) error {
 	if m == nil {
 		return fmt.Errorf("pfctl -E gave no token, so pf's reference could not be kept: %s", strings.TrimSpace(res.Output))
 	}
-	if err := p.u.sys.MkdirAll(p.u.stateDir, 0o700); err != nil {
-		return err
+	record := p.u.sys.MkdirAll(p.u.stateDir, 0o700)
+	if record == nil {
+		record = writeFileAtomic(p.tokenPath(), []byte(m[1]+"\n"), 0o600)
 	}
-	return writeFileAtomic(p.tokenPath(), []byte(m[1]+"\n"), 0o600)
+	if record != nil {
+		// A reference nobody wrote down could never be released, so it is given
+		// back at once, and the old one, which is written down, stays.
+		_, _ = p.u.sys.Run(ctx, jobUserCommand{Argv: []string{"/sbin/pfctl", "-X", m[1]}})
+		return record
+	}
+	if old != "" && old != m[1] {
+		if _, err := p.u.run(ctx, "/sbin/pfctl", "-X", old); err != nil {
+			p.u.log.Warn("could not release the firewall reference an earlier run of the agent took", "error", err)
+		}
+	}
+	return nil
 }
 
 // errJobUserAnchorChanged is the anchor not being what was loaded.

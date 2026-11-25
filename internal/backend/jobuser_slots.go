@@ -39,7 +39,10 @@ const (
 	jobUserMaxCapacity = jobUserMaxSlots - 1
 	// jobUserUIDLimit is the top of the range nothing else may hold.
 	jobUserUIDLimit = 699
-	jobUserShell    = "/bin/zsh"
+	// jobUserShell is what a job's SHELL says. It is not the account's login
+	// shell, which is jobUserLoginShell: nobody can log in as a slot.
+	jobUserShell      = "/bin/zsh"
+	jobUserLoginShell = "/usr/bin/false"
 	// jobUserRunDirName is where the runner is laid out inside a slot's home.
 	jobUserRunDirName = "actions-runner"
 	// jobUserTrashName is where a wiped home waits to be deleted.
@@ -65,15 +68,22 @@ type jobUserSlot struct {
 	n    int
 	name string
 	uid  int
-	// offered is whether new jobs may use it. Accounts above a reduced capacity
-	// are left alone and unused, but one that still holds a job is still reset.
+	// offered is whether new jobs may use it. An account above a reduced capacity
+	// is drained: never offered again, but still covered by the firewall, still
+	// stopped when the firewall fails and still reset after the job it holds ends.
 	offered bool
+	// exists is whether the Mac has the account, whether or not it is offered. It
+	// is set by ensureSlots before anything else runs, and read after that.
+	exists bool
 
 	// The fields below are guarded by jobUsers.mu.
 
 	// holder is the runner directory using the slot, or empty when it is free.
 	holder  string
 	healthy bool
+	// admitGen is the stop generation the slot was admitted under, which only the
+	// create that holds the slot reads.
+	admitGen uint64
 	// failures counts resets that failed in a row; nextRetry is when the watcher
 	// tries again; lastErr is what the last one said.
 	failures  int
@@ -102,9 +112,13 @@ type jobUsers struct {
 
 	mu    sync.Mutex
 	slots []*jobUserSlot
-	// stopped holds the runner directories the agent asked to stop, which the
-	// breaker does not count as a runner that failed to take a job.
-	stopped map[string]bool
+	// startMu orders the start of a runner against stopping every job. A create
+	// holds it for reading from its last check to the start of its runner, and
+	// stopAllSlots takes it for writing to count a stop, so a runner is either
+	// started before the stop and killed by it, or sees the stop and is not
+	// started. stopGen is the count, guarded by startMu.
+	startMu sync.RWMutex
+	stopGen uint64
 	// probedHeld and reprobe are the VM backend's pair: whether the last probe
 	// found the host held, and whether something since then needs a fresh one.
 	probedHeld atomic.Bool
@@ -181,7 +195,6 @@ func buildJobUsers(o JobUserOptions, workDir string, log *slog.Logger) (*jobUser
 		capacity:   o.Capacity,
 		mustAllow:  append([]string(nil), o.EgressMustAllow...),
 		mustBlock:  append([]string(nil), o.EgressMustBlock...),
-		stopped:    make(map[string]bool),
 		watchEvery: jobUserWatchEvery,
 	}
 	if u.now == nil {
@@ -219,6 +232,18 @@ func buildJobUsers(o JobUserOptions, workDir string, log *slog.Logger) (*jobUser
 	u.gate = newJobUserGate(u, dial)
 	u.pf = &jobUserPF{u: u}
 	return u, nil
+}
+
+// covered returns every account the firewall, the stop on a breach and the
+// start-up reset must reach: the offered ones and any other that exists.
+func (u *jobUsers) covered() []*jobUserSlot {
+	var out []*jobUserSlot
+	for _, s := range u.slots {
+		if s.offered || s.exists {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // offered returns the accounts new jobs may use, in order.
@@ -423,7 +448,10 @@ func checkJobUserAccounts(users, groups map[string]int) error {
 
 // ensureSlots makes the group and any missing account, and refuses to go on if
 // an existing one is not as Zoomies would have made it. It runs at start, before
-// any job is admitted, so no job user is running while it works.
+// any job is admitted, so no job user is running while it works. Every account in
+// the range that exists is checked, offered or not, because a job that survived
+// a restart can be running in one, and Zoomies wipes its home when that job ends.
+// Nothing is changed until all of them have been looked at.
 func (u *jobUsers) ensureSlots(ctx context.Context) error {
 	out, err := u.run(ctx, "/usr/bin/dscl", ".", "-list", "/Users", "UniqueID")
 	if err != nil {
@@ -437,6 +465,21 @@ func (u *jobUsers) ensureSlots(ctx context.Context) error {
 	groups := parseJobUserIDs(out)
 	if err := checkJobUserAccounts(users, groups); err != nil {
 		return err
+	}
+
+	var existing, wrongShell []*jobUserSlot
+	for _, s := range u.slots {
+		if _, ok := users[s.name]; !ok {
+			continue
+		}
+		shell, err := u.checkAccount(ctx, s)
+		if err != nil {
+			return err
+		}
+		existing = append(existing, s)
+		if shell != jobUserLoginShell {
+			wrongShell = append(wrongShell, s)
+		}
 	}
 
 	// The group comes first: an account made without it would be in staff for as
@@ -454,28 +497,109 @@ func (u *jobUsers) ensureSlots(ctx context.Context) error {
 			}
 		}
 	}
+	for _, s := range wrongShell {
+		// An account somebody made by hand, or an older Zoomies. Nobody may log in as
+		// a slot: with Remote Login open to every user, a job could write an
+		// authorized_keys file and be followed in by whoever holds the key.
+		if err := u.setLoginShell(ctx, s); err != nil {
+			return err
+		}
+		u.log.Info("changed a job user's login shell to one that cannot log in", "slot", s.name)
+	}
+	for _, s := range existing {
+		s.exists = true
+	}
 	for _, s := range u.offered() {
-		if _, ok := users[s.name]; ok {
-			if err := u.checkPrimaryGroup(ctx, s); err != nil {
-				return err
-			}
+		if s.exists {
 			continue
 		}
 		if err := u.createAccount(ctx, s); err != nil {
 			return err
 		}
+		s.exists = true
 	}
 	return nil
 }
 
-func (u *jobUsers) checkPrimaryGroup(ctx context.Context, s *jobUserSlot) error {
-	out, err := u.run(ctx, "/usr/bin/dscl", ".", "-read", "/Users/"+s.name, "PrimaryGroupID")
+// readUserAttr reads one attribute of a local account with dscl, whose answer is
+// "Name: value", or the value on the next line when it has spaces in it.
+func (u *jobUsers) readUserAttr(ctx context.Context, s *jobUserSlot, attr string) (string, error) {
+	out, err := u.run(ctx, "/usr/bin/dscl", ".", "-read", "/Users/"+s.name, attr)
 	if err != nil {
-		return fmt.Errorf("reading the group of %s: %w", s.name, err)
+		return "", err
 	}
-	f := strings.Fields(out)
-	if len(f) == 0 || f[len(f)-1] != strconv.Itoa(jobUserGID) {
-		return fmt.Errorf("%w: the account %s exists but its primary group is not %s (GID %d), so a job in it could read other users' homes; set it with dscl or delete the account and let Zoomies make it", ErrBackendConfig, s.name, jobUserGroup, jobUserGID)
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), attr+":")
+		if !ok {
+			continue
+		}
+		if v := strings.TrimSpace(rest); v != "" {
+			return v, nil
+		}
+		if i+1 < len(lines) {
+			return strings.TrimSpace(lines[i+1]), nil
+		}
+	}
+	return "", fmt.Errorf("dscl did not print %s for %s", attr, s.name)
+}
+
+// isAdmin asks whether an account is in the admin group. dseditgroup answers
+// "yes NAME is a member of admin" or "no NAME is NOT a member of admin", and its
+// exit code for the second is 67, which is also what an error gives, so the answer
+// is read from the text and anything else is "cannot tell".
+func (u *jobUsers) isAdmin(ctx context.Context, name string) (bool, error) {
+	res, err := u.sys.Run(ctx, jobUserCommand{Argv: []string{"/usr/sbin/dseditgroup", "-o", "checkmember", "-m", name, "admin"}})
+	if err != nil {
+		return false, err
+	}
+	switch out := strings.TrimSpace(res.Output); {
+	case strings.HasPrefix(out, "yes "):
+		return true, nil
+	case strings.HasPrefix(out, "no "):
+		return false, nil
+	default:
+		return false, fmt.Errorf("dseditgroup said %q and exited %d", jobUserFirstLine(out), res.ExitCode)
+	}
+}
+
+// checkAccount refuses an existing account that is not what Zoomies would have
+// made, before anything is changed: its primary group, its home and its standing
+// all decide what wiping its home does. It returns the account's login shell,
+// which is "" when dscl cannot say, and which ensureSlots corrects afterwards.
+func (u *jobUsers) checkAccount(ctx context.Context, s *jobUserSlot) (shell string, err error) {
+	gid, err := u.readUserAttr(ctx, s, "PrimaryGroupID")
+	if err != nil {
+		return "", fmt.Errorf("reading the group of %s: %w", s.name, err)
+	}
+	if gid != strconv.Itoa(jobUserGID) {
+		return "", fmt.Errorf("%w: the account %s exists but its primary group is not %s (GID %d), so a job in it could read other users' homes; set it with dscl or delete the account and let Zoomies make it", ErrBackendConfig, s.name, jobUserGroup, jobUserGID)
+	}
+	home, err := u.readUserAttr(ctx, s, "NFSHomeDirectory")
+	if err != nil {
+		return "", fmt.Errorf("reading the home of %s: %w", s.name, err)
+	}
+	if home != u.home(s) {
+		return "", fmt.Errorf("%w: the account %s has its home at %s, and a job user's is %s; Zoomies wipes that folder after every job and will not adopt an account whose home is anywhere else, so delete the account and let Zoomies make it", ErrBackendConfig, s.name, home, u.home(s))
+	}
+	admin, err := u.isAdmin(ctx, s.name)
+	if err != nil {
+		return "", fmt.Errorf("%w: could not tell whether the account %s is a member of admin (%v), and Zoomies will not wipe the home of one that may be a person's", ErrBackendConfig, s.name, err)
+	}
+	if admin {
+		return "", fmt.Errorf("%w: the account %s is a member of admin, so it is somebody's own account and not one Zoomies made; remove it from the group or delete the account and let Zoomies make it", ErrBackendConfig, s.name)
+	}
+	shell, err = u.readUserAttr(ctx, s, "UserShell")
+	if err != nil {
+		// An account with no shell set reads as an error; it is corrected the same.
+		return "", nil
+	}
+	return shell, nil
+}
+
+func (u *jobUsers) setLoginShell(ctx context.Context, s *jobUserSlot) error {
+	if _, err := u.run(ctx, "/usr/bin/dscl", ".", "-create", "/Users/"+s.name, "UserShell", jobUserLoginShell); err != nil {
+		return fmt.Errorf("setting the login shell of %s to %s: %w", s.name, jobUserLoginShell, err)
 	}
 	return nil
 }
@@ -483,23 +607,25 @@ func (u *jobUsers) checkPrimaryGroup(ctx context.Context, s *jobUserSlot) error 
 // createAccount makes one account. The password is 32 random bytes, passed once
 // and never stored or used: sysadminctl wants one, and the account is never
 // logged in to. It is on the command line for a moment, when no job is running
-// anywhere on this host.
+// anywhere on this host. The login shell is set straight afterwards, with the
+// group, and the account is not kept if either fails.
 func (u *jobUsers) createAccount(ctx context.Context, s *jobUserSlot) error {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return fmt.Errorf("making a password for %s: %w", s.name, err)
 	}
 	if _, err := u.run(ctx, "/usr/sbin/sysadminctl", "-addUser", s.name, "-UID", strconv.Itoa(s.uid),
-		"-shell", jobUserShell, "-home", u.home(s), "-password", base64.StdEncoding.EncodeToString(raw)); err != nil {
+		"-home", u.home(s), "-password", base64.StdEncoding.EncodeToString(raw)); err != nil {
 		return fmt.Errorf("creating the account %s: %w", s.name, err)
 	}
 	for _, argv := range [][]string{
+		{"/usr/bin/dscl", ".", "-create", "/Users/" + s.name, "UserShell", jobUserLoginShell},
 		{"/usr/bin/dscl", ".", "-create", "/Users/" + s.name, "PrimaryGroupID", strconv.Itoa(jobUserGID)},
 		{"/usr/bin/dscl", ".", "-create", "/Users/" + s.name, "IsHidden", "1"},
 	} {
 		if _, err := u.run(ctx, argv...); err != nil {
-			// An account left in staff is the leak this design exists to close,
-			// so it is not kept half made.
+			// An account left in staff is the leak this design exists to close, and
+			// one with a login shell is a way in, so it is not kept half made.
 			_, _ = u.run(ctx, "/usr/sbin/sysadminctl", "-deleteUser", s.name)
 			return fmt.Errorf("setting up the account %s: %w", s.name, err)
 		}

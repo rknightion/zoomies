@@ -241,8 +241,9 @@ func Join(ctx context.Context, opts JoinOptions) error {
 		capacity = isolation.vmpal.MaxVMs
 	}
 	if isolation.usesUser() && opts.Capacity <= 0 {
-		// Four is what the design runs, and half the cores of a big Mac would
-		// not be a deliberate choice of how many jobs may share it.
+		// The default is the usual one for the Mac's cores, but never more than
+		// the most job users there can be: a Mac with more cores than that has
+		// not chosen to run that many jobs at once.
 		capacity = min(capacity, config.MaxJobUsersCapacity)
 	}
 	serviceUser, serviceGroup := opts.ServiceUser, opts.ServiceUser

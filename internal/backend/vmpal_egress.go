@@ -202,6 +202,13 @@ type vmpalPolicyGate struct {
 	asker func(ctx context.Context, name string, targets []string) ([]string, error)
 	the   string
 	a     string
+	// unreachableBlocks reads "unreachable" from a must-block target the Mac itself
+	// reached as a block, like a timeout. It is for job users: the probe runs on
+	// the same host over the same routes as the Mac's own dial, so the firewall is
+	// the only difference, and pf can refuse a packet it drops from a local socket
+	// with an error from the kernel as well as by dropping it silently. A VM guest
+	// has routes of its own, so there it is still a doubt.
+	unreachableBlocks bool
 }
 
 // subject is what the check calls whatever it is testing from, for the reasons
@@ -311,6 +318,8 @@ func (g *vmpalPolicyGate) check(ctx context.Context, name string) *vmpalEgressFa
 			return &vmpalEgressFailure{Breach: true, Reason: fmt.Sprintf("%s got an answer from %s (%s), which the firewall must block", a, target, answer)}
 		case macErr != nil:
 			doubts = append(doubts, fmt.Sprintf("the Mac could not reach must-block target %s, so %s failing to reach it proves nothing; check that it is up (%v)", target, the, macErr))
+		case answer == vmpalEgressUnreachable && g.unreachableBlocks:
+			// Blocked, as a timeout is.
 		case answer != vmpalEgressTimeout:
 			doubts = append(doubts, fmt.Sprintf("%s's attempt on %s ended in %s rather than timing out", the, target, answer))
 		}

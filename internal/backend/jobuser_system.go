@@ -43,6 +43,13 @@ type jobUserIface struct {
 	HasAddr bool
 }
 
+// jobUserMount is one mounted filesystem: where it is mounted, and the user who
+// mounted it, which the kernel records.
+type jobUserMount struct {
+	Path  string
+	Owner int
+}
+
 // jobUserSystem is the host, as far as job users are concerned.
 type jobUserSystem interface {
 	// Run runs a command and waits for it. The error is for a command that could
@@ -57,6 +64,11 @@ type jobUserSystem interface {
 	Chown(path string, uid, gid int) error
 	// Owner says who owns a file that Lstat or ReadDir described.
 	Owner(path string, fi fs.FileInfo) (uid, gid int, ok bool)
+	// Dev says which filesystem a file that Lstat or ReadDir described is on, so
+	// that a walk can refuse to cross into a mounted one.
+	Dev(path string, fi fs.FileInfo) (dev uint64, ok bool)
+	// Mounts reads the kernel's mount table.
+	Mounts() ([]jobUserMount, error)
 	// ReadFile reads a regular file, refusing a link at the final step and
 	// anything larger than max, because the files it is used on belong to a job.
 	ReadFile(path string, max int64) ([]byte, error)

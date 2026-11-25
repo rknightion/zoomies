@@ -76,6 +76,50 @@ func (darwinJobUserSystem) Owner(_ string, fi fs.FileInfo) (uid, gid int, ok boo
 	return fileOwner(fi)
 }
 
+func (darwinJobUserSystem) Dev(_ string, fi fs.FileInfo) (uint64, bool) { return fileDev(fi) }
+
+// mntNoWait is MNT_NOWAIT: the table as the kernel holds it, without asking each
+// filesystem to refresh its figures, which a dead network mount would never
+// answer.
+const mntNoWait = 2
+
+// Mounts reads the mount table with getfsstat, so a mount point whose name
+// contains spaces or brackets, which a job can choose, is never parsed out of
+// text.
+func (darwinJobUserSystem) Mounts() ([]jobUserMount, error) {
+	n, err := syscall.Getfsstat(nil, mntNoWait)
+	if err != nil {
+		return nil, fmt.Errorf("counting the mounted filesystems: %w", err)
+	}
+	for {
+		buf := make([]syscall.Statfs_t, n+16)
+		got, err := syscall.Getfsstat(buf, mntNoWait)
+		if err != nil {
+			return nil, fmt.Errorf("reading the mount table: %w", err)
+		}
+		if got < len(buf) {
+			out := make([]jobUserMount, 0, got)
+			for i := range got {
+				out = append(out, jobUserMount{Path: mountPath(buf[i].Mntonname[:]), Owner: int(buf[i].Owner)})
+			}
+			return out, nil
+		}
+		// A filesystem was mounted between the two calls and the buffer was full.
+		n = got * 2
+	}
+}
+
+func mountPath(name []int8) string {
+	b := make([]byte, 0, len(name))
+	for _, c := range name {
+		if c == 0 {
+			break
+		}
+		b = append(b, byte(c))
+	}
+	return string(b)
+}
+
 func (darwinJobUserSystem) ReadFile(path string, max int64) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {

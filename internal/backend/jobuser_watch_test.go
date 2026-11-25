@@ -136,6 +136,70 @@ func TestWatchEmptiesTheTrashOffTheJobPath(t *testing.T) {
 	}
 }
 
+func TestWatchClearsEveryFlagOnATrashEntryBeforeDeletingIt(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	trash := filepath.Join(x.f.usersDir, jobUserTrashName)
+	entry := filepath.Join(trash, "zj01-1")
+	if err := os.MkdirAll(filepath.Join(entry, "Library"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	x.f.reset()
+	x.u.watchOnce(context.Background())
+	// A job can set a flag after the home was moved aside only if something of it
+	// still ran, but one set before is still there, and one append-only file
+	// would fail the sweep every minute for ever.
+	flags, del := x.f.indexOf("chflags -R 0 "+entry), x.f.indexOf("removeall "+entry)
+	if flags < 0 || del < 0 || flags > del {
+		t.Errorf("flags cleared at %d, entry deleted at %d; want the flags first: %v", flags, del, x.f.logged())
+	}
+}
+
+func TestWatchWillNotDeleteThroughAMountInsideATrashEntry(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	trash := filepath.Join(x.f.usersDir, jobUserTrashName)
+	entry := filepath.Join(trash, "zj01-1")
+	mount := filepath.Join(entry, "Documents", "dmg")
+	if err := os.MkdirAll(filepath.Join(mount, "precious"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// What is under the mount point is another filesystem: deleting through it
+	// would delete that, wherever it comes from.
+	x.f.devs[mount] = 7
+	x.f.mounts = []jobUserMount{{Path: mount, Owner: 0}}
+	x.f.fail("umount")
+	x.f.fail("diskutil")
+	x.f.reset()
+
+	x.u.watchOnce(context.Background())
+
+	if x.f.indexOf("removeall") >= 0 {
+		t.Errorf("a trash entry with a mounted filesystem inside was deleted: %v", x.f.logged())
+	}
+	if _, err := os.Stat(filepath.Join(mount, "precious")); err != nil {
+		t.Errorf("what was under the mount point is gone: %v", err)
+	}
+}
+
+func TestWatchUnmountsAMountInsideATrashEntryAndThenDeletesIt(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	trash := filepath.Join(x.f.usersDir, jobUserTrashName)
+	entry := filepath.Join(trash, "zj01-1")
+	mount := filepath.Join(entry, "Documents", "dmg")
+	if err := os.MkdirAll(mount, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	x.f.devs[mount] = 7
+	x.f.mounts = []jobUserMount{{Path: mount, Owner: 0}}
+	x.f.reset()
+
+	x.u.watchOnce(context.Background())
+
+	un, del := x.f.indexOf("umount -f "+mount), x.f.indexOf("removeall "+entry)
+	if un < 0 || del < 0 || un > del {
+		t.Errorf("unmounted at %d, deleted at %d; want the mount taken off first: %v", un, del, x.f.logged())
+	}
+}
+
 func TestTheWatcherRunsUntilTheBackendIsClosed(t *testing.T) {
 	x := newJobUserFixture(t, 1)
 	x.u.watchEvery = 5 * time.Millisecond

@@ -135,7 +135,7 @@ func TestResetClearsImmutableFlagsBeforeMovingTheHome(t *testing.T) {
 	if err := x.u.resetSlot(context.Background(), x.u.slotNamed("zj01")); err != nil {
 		t.Fatal(err)
 	}
-	flags := x.f.indexOf("chflags -R nouchg,noschg " + home)
+	flags := x.f.indexOf("chflags -R 0 " + home)
 	move := x.f.indexOf("rename " + home)
 	create := x.f.indexOf("createhomedir -c -u zj01")
 	if flags < 0 || move < 0 || create < 0 || !(flags < move && move < create) {
@@ -308,11 +308,121 @@ func TestResetStepsReadTheExitCodesLaunchctlAndCrontabUse(t *testing.T) {
 
 func TestResetRemovesTheAtJobsOfTheSlotAndNobodyElses(t *testing.T) {
 	x := startedJobUserFixture(t, 1)
-	x.f.answer("12\tWed Nov 25 13:00:00 2026\ta zj01\n13\tWed Nov 25 13:00:00 2026\ta alice\n", "atq")
+	// atq on macOS prints a job number and a date and no owner, even to root, so
+	// a reset that read it could never tell whose job was whose. The spool's
+	// files carry their owner, and only the slot's are deleted.
 	if err := x.u.removeScheduled(context.Background(), x.u.slotNamed("zj01")); err != nil {
 		t.Fatal(err)
 	}
-	if x.f.indexOf("atrm 12") < 0 || x.f.indexOf("atrm 13") >= 0 {
-		t.Errorf("atrm ran for the wrong jobs: %v", x.f.logged())
+	if x.f.indexOf("find -x -P /private/var/at/jobs -maxdepth 1 -type f -user 651 -delete") < 0 {
+		t.Errorf("the slot's at jobs were not removed by owner: %v", x.f.logged())
+	}
+	if x.f.indexOf("atq") >= 0 || x.f.indexOf("atrm") >= 0 {
+		t.Errorf("the reset still reads atq, which names no owner on macOS: %v", x.f.logged())
+	}
+}
+
+func TestResetClearsEveryFlagBeforeMovingTheHome(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	home := filepath.Join(x.f.usersDir, "zj01")
+	if err := x.u.resetSlot(context.Background(), x.u.slotNamed("zj01")); err != nil {
+		t.Fatal(err)
+	}
+	// uappnd and sappnd stop a rename and a delete as surely as uchg does, and a
+	// job can set any flag it owns the file for: all of them go, not a list.
+	if x.f.indexOf("chflags -R nouchg,noschg") >= 0 {
+		t.Errorf("only some flags were cleared: %v", x.f.logged())
+	}
+	if x.f.indexOf("chflags -R 0 "+home) < 0 {
+		t.Errorf("flags were not all cleared: %v", x.f.logged())
+	}
+}
+
+func TestResetUnmountsWhatTheJobMountedBeforeMovingTheHome(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	home := filepath.Join(x.f.usersDir, "zj01")
+	x.f.mounts = []jobUserMount{
+		{Path: home + "/dmg", Owner: 651},
+		{Path: home + "/dmg/inner", Owner: 0},
+		{Path: "/Volumes/job-image", Owner: 651},
+		{Path: "/Volumes/somebody-elses", Owner: 501},
+		{Path: "/", Owner: 0},
+	}
+	if err := x.u.resetSlot(context.Background(), x.u.slotNamed("zj01")); err != nil {
+		t.Fatal(err)
+	}
+	// Under the home whoever mounted it, and anywhere else when this account did.
+	for _, p := range []string{home + "/dmg/inner", home + "/dmg", "/Volumes/job-image"} {
+		if x.f.indexOf("umount -f "+p) < 0 {
+			t.Errorf("%s was not unmounted: %v", p, x.f.logged())
+		}
+	}
+	for _, l := range x.f.logged() {
+		if strings.Contains(l, "umount") && (strings.HasSuffix(l, " /Volumes/somebody-elses") || strings.HasSuffix(l, " /")) {
+			t.Errorf("%q: a filesystem the job did not mount was unmounted", l)
+		}
+	}
+	// The inner mount first, or the outer one is busy.
+	inner := x.f.indexOf("umount -f " + home + "/dmg/inner")
+	outer := x.f.indexAfter(inner+1, "umount -f "+home+"/dmg")
+	move := x.f.indexOf("rename " + home)
+	if inner < 0 || !(inner < outer && outer < move) {
+		t.Errorf("inner at %d, outer at %d, move at %d; want the deepest mount first and all before the home moves", inner, outer, move)
+	}
+}
+
+func TestResetFallsBackToDiskutilAndStopsWhenAMountWillNotGo(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	home := filepath.Join(x.f.usersDir, "zj01")
+	s := x.u.slotNamed("zj01")
+	x.f.mounts = []jobUserMount{{Path: home + "/dmg", Owner: 651}}
+	x.f.failOnce("umount")
+	if err := x.u.resetSlot(context.Background(), s); err != nil {
+		t.Fatalf("a mount that diskutil could take was not enough: %v", err)
+	}
+	if x.f.indexOf("diskutil unmount force "+home+"/dmg") < 0 {
+		t.Errorf("diskutil was not tried: %v", x.f.logged())
+	}
+
+	// Neither works: the home stays where it is, because moving it would take the
+	// mount's contents along or leave the mount to be deleted through.
+	x.f.reset()
+	x.f.mounts = []jobUserMount{{Path: home + "/dmg", Owner: 651}}
+	x.f.fail("umount")
+	x.f.fail("diskutil")
+	err := x.u.resetSlot(context.Background(), s)
+	if err == nil || !strings.Contains(err.Error(), "dmg") {
+		t.Fatalf("reset = %v; want a failure naming the mount", err)
+	}
+	if x.f.indexOf("rename") >= 0 || x.f.indexOf("createhomedir") >= 0 {
+		t.Errorf("the home was replaced with a mount still in it: %v", x.f.logged())
+	}
+}
+
+func TestTheCleanedTreesAreOneListThatHoldsLibraryCaches(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	// Cleaned because a job can write there when it is world-writable, which it is
+	// on the Macs this was checked on. A tree that is not writable by a job holds
+	// nothing the job owns, so cleaning it does no harm.
+	found := false
+	for _, tree := range x.u.sharedTrees() {
+		found = found || tree == "/Library/Caches"
+	}
+	if !found {
+		t.Errorf("the cleaned trees are %v; want /Library/Caches among them", x.u.sharedTrees())
+	}
+	// Reset and verify both read the same list.
+	x.f.reset()
+	if err := x.u.resetSlot(context.Background(), x.u.slotNamed("zj01")); err != nil {
+		t.Fatal(err)
+	}
+	for _, tree := range x.u.sharedTrees() {
+		if _, err := x.f.Lstat(tree); err != nil {
+			continue
+		}
+		del, ver := x.f.indexOf("find -x -P "+tree+" -user 651 -delete"), x.f.indexOf("find -x -P "+tree+" -user 651 -print")
+		if del < 0 || ver < 0 {
+			t.Errorf("%s: cleaned at %d and verified at %d", tree, del, ver)
+		}
 	}
 }

@@ -131,7 +131,7 @@ func TestEnsureSlotsRefusesAnExistingAccountInTheWrongGroup(t *testing.T) {
 	}
 }
 
-func TestEnsureSlotsLeavesAccountsAboveAReducedCapacityAlone(t *testing.T) {
+func TestEnsureSlotsNeitherMakesNorOffersAccountsAboveAReducedCapacity(t *testing.T) {
 	x := newJobUserFixture(t, 1)
 	for n := 1; n <= 4; n++ {
 		x.f.users[jobUserName(n)] = jobUserUID(n)
@@ -142,13 +142,85 @@ func TestEnsureSlotsLeavesAccountsAboveAReducedCapacityAlone(t *testing.T) {
 	if err := x.u.ensureSlots(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"zj03", "zj04"} {
-		if x.f.indexOf(name) >= 0 {
-			t.Errorf("%s is above capacity plus one and must not be touched: %v", name, x.f.logged())
-		}
+	// They are checked, because they are Zoomies's to wipe when a job that was
+	// running in one is removed, but not made, deleted or changed.
+	if x.f.count("sysadminctl") != 0 || x.f.count("dscl . -create /Users/zj03") != 0 || x.f.count("dscl . -create /Users/zj04") != 0 {
+		t.Errorf("an account above capacity plus one was changed: %v", x.f.logged())
 	}
 	if x.u.slotNamed("zj03").offered {
 		t.Error("zj03 is offered to jobs")
+	}
+}
+
+func TestEnsureSlotsGivesNewAccountsNoLoginShell(t *testing.T) {
+	x := newJobUserFixture(t, 1)
+	if err := x.u.ensureSlots(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// With Remote Login open to every user, a login shell would let a job write
+	// an authorized_keys file and have somebody log in as the slot afterwards.
+	for _, name := range []string{"zj01", "zj02"} {
+		if got := x.f.shellOf[name]; got != "/usr/bin/false" {
+			t.Errorf("%s has the login shell %q; want /usr/bin/false", name, got)
+		}
+	}
+	if x.f.indexOf("-shell /bin/zsh") >= 0 {
+		t.Errorf("an account was made with a real login shell: %v", x.f.logged())
+	}
+}
+
+func TestEnsureSlotsCorrectsAnExistingAccountsLoginShell(t *testing.T) {
+	x := newJobUserFixture(t, 1)
+	x.f.users["zj01"] = 651
+	x.f.groupOf["zj01"] = jobUserGID
+	x.f.shellOf["zj01"] = "/bin/zsh"
+	x.f.groups[jobUserGroup] = jobUserGID
+
+	if err := x.u.ensureSlots(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if x.f.shellOf["zj01"] != "/usr/bin/false" || x.f.indexOf("dscl . -create /Users/zj01 UserShell /usr/bin/false") < 0 {
+		t.Errorf("zj01's shell is %q and the log is %v", x.f.shellOf["zj01"], x.f.logged())
+	}
+}
+
+func TestEnsureSlotsRefusesAnExistingAccountThatIsAnAdministratorOrLivesElsewhere(t *testing.T) {
+	for name, tc := range map[string]struct {
+		set  func(f *fakeJobUsers)
+		want string
+	}{
+		"an administrator": {func(f *fakeJobUsers) { f.admins["zj02"] = true }, "admin"},
+		"a home elsewhere": {func(f *fakeJobUsers) { f.homeOf["zj02"] = "/Users/alice" }, "/Users/alice"},
+	} {
+		x := newJobUserFixture(t, 2)
+		x.f.groups[jobUserGroup] = jobUserGID
+		for _, n := range []string{"zj01", "zj02"} {
+			x.f.users[n] = jobUserUID(int(n[3] - '0'))
+			x.f.groupOf[n] = jobUserGID
+		}
+		// A shell that would be corrected, so that a refusal that came late would show.
+		x.f.shellOf["zj01"] = "/bin/zsh"
+		tc.set(x.f)
+
+		err := x.u.ensureSlots(context.Background())
+		if err == nil || !errors.Is(err, ErrBackendConfig) || !strings.Contains(err.Error(), "zj02") || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: ensureSlots = %v; want a refusal naming zj02 and %q", name, err, tc.want)
+		}
+		// Whatever the account is, the host is not changed on the way to refusing it.
+		if x.f.count("sysadminctl") != 0 || x.f.count("dscl . -create") != 0 {
+			t.Errorf("%s: the host was changed before the refusal: %v", name, x.f.logged())
+		}
+	}
+}
+
+func TestEnsureSlotsRefusesWhenItCannotTellWhetherAnAccountIsAnAdministrator(t *testing.T) {
+	x := newJobUserFixture(t, 1)
+	x.f.groups[jobUserGroup] = jobUserGID
+	x.f.users["zj01"] = 651
+	x.f.groupOf["zj01"] = jobUserGID
+	x.f.answer("something nobody expected\n", "dseditgroup")
+	if err := x.u.ensureSlots(context.Background()); err == nil || !strings.Contains(err.Error(), "zj01") {
+		t.Fatalf("ensureSlots = %v; want a refusal, because an account that may be an administrator is not wiped", err)
 	}
 }
 

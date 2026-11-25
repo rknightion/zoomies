@@ -454,15 +454,14 @@ func TestNewProcessRefusesJobUsersWithNoEgressListsOrTooManyJobs(t *testing.T) {
 	}
 }
 
-func TestJobUserBreakerCountsRunnersThatExitWithoutTakingAJob(t *testing.T) {
+func TestJobUserHostIsNotHeldByRunnersThatExitWithoutTakingAJob(t *testing.T) {
+	// The VM backend holds a host whose runners keep leaving without a job. Here
+	// there is no evidence a runner outside the job's own home could rely on: a
+	// job can delete the worker's logs, and a burst of short jobs on a healthy host
+	// looks the same. The design leaves the breaker out of this mode.
 	x := startedJobUserFixture(t, 1)
-	for i := range vmpalBreakerThreshold {
-		if x.u.state.held() != nil {
-			t.Fatalf("held after only %d", i)
-		}
+	for i := range vmpalBreakerThreshold + 1 {
 		h := jobUserCreate(t, x, "runner-"+string(rune('a'+i)))
-		// The runner dies on its own: nobody asked it to stop, and it never ran
-		// a job, which is what a broken host looks like.
 		meta, _ := readMeta(string(h))
 		if err := syscall.Kill(meta.PID, syscall.SIGKILL); err != nil {
 			t.Fatal(err)
@@ -471,56 +470,10 @@ func TestJobUserBreakerCountsRunnersThatExitWithoutTakingAJob(t *testing.T) {
 		if err := x.b.Remove(context.Background(), h); err != nil {
 			t.Fatal(err)
 		}
+		if held := x.u.state.held(); held != nil {
+			t.Fatalf("held after %d runners left without a job: %v", i+1, held)
+		}
 	}
-	held := x.u.state.held()
-	if !errors.Is(held, errJobUsersHeld) || !strings.Contains(held.Error(), "exited without taking a job") {
-		t.Fatalf("held = %v; want the breaker's hold", held)
-	}
-}
-
-func TestJobUserBreakerIgnoresRunnersTheAgentStoppedAndRunnersThatTookAJob(t *testing.T) {
-	t.Run("a runner the agent stopped itself", func(t *testing.T) {
-		x := startedJobUserFixture(t, 1)
-		for i := range vmpalBreakerThreshold + 1 {
-			h := jobUserCreate(t, x, "runner-"+string(rune('a'+i)))
-			waitForLog(t, string(h), "listener started with run", 10*time.Second)
-			if err := x.b.Stop(context.Background(), h, 10*time.Second); err != nil {
-				t.Fatal(err)
-			}
-			waitForPhase(t, x.b, h, PhaseExited, 10*time.Second)
-			if err := x.b.Remove(context.Background(), h); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := x.u.state.held(); err != nil {
-			t.Errorf("stopping runners tripped the breaker, which short real jobs would then do too: %v", err)
-		}
-	})
-	t.Run("a runner that left a worker log", func(t *testing.T) {
-		x := startedJobUserFixture(t, 1)
-		for i := range vmpalBreakerThreshold + 1 {
-			h := jobUserCreate(t, x, "runner-"+string(rune('a'+i)))
-			waitForLog(t, string(h), "listener started with run", 10*time.Second)
-			diag := filepath.Join(x.f.usersDir, "zj01", jobUserRunDirName, "_diag")
-			if err := os.MkdirAll(diag, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(diag, "Worker_1.log"), nil, 0o644); err != nil {
-				t.Fatal(err)
-			}
-			meta, _ := readMeta(string(h))
-			if err := syscall.Kill(meta.PID, syscall.SIGKILL); err != nil {
-				t.Fatal(err)
-			}
-			waitForPhase(t, x.b, h, PhaseFailed, 10*time.Second)
-			if err := x.b.Remove(context.Background(), h); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := x.u.state.held(); err != nil {
-			t.Errorf("runners that took a job tripped the breaker: %v", err)
-		}
-	})
 }
 
 func TestJobUserCreateHoldsTheHostWhenTheFirewallIsGone(t *testing.T) {

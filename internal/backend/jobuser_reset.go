@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ const (
 	stepStop      = "stop every process"
 	stepBootout   = "boot out the launchd domains"
 	stepScheduled = "remove cron and at jobs"
+	stepMounts    = "unmount what the job mounted"
 	stepHome      = "replace the home"
 	stepTemp      = "remove the per-user temporary folder"
 	stepShared    = "remove files in the shared folders"
@@ -62,6 +64,7 @@ func (u *jobUsers) resetSlot(ctx context.Context, s *jobUserSlot) error {
 		{stepStop, u.stopProcesses},
 		{stepBootout, u.bootoutDomains},
 		{stepScheduled, u.removeScheduled},
+		{stepMounts, u.unmountJobMounts},
 		{stepHome, u.replaceHome},
 		{stepTemp, u.removeUserTemp},
 		{stepShared, u.removeSharedFiles},
@@ -79,9 +82,16 @@ func (u *jobUsers) resetSlot(ctx context.Context, s *jobUserSlot) error {
 // resetAndFree resets a slot a job is finished with and then offers it again,
 // or marks it unhealthy so that the watcher keeps trying.
 func (u *jobUsers) resetAndFree(ctx context.Context, s *jobUserSlot) error {
-	if err := u.resetSlot(ctx, s); err != nil {
-		u.markUnhealthy(s, err)
-		return err
+	return u.free(s, u.resetSlot(ctx, s))
+}
+
+// free gives a slot back after its reset: in service if the reset worked, and
+// out of it, to be tried again, if not. The caller has to have finished with
+// everything that names the slot, because the next create can take it from here.
+func (u *jobUsers) free(s *jobUserSlot, resetErr error) error {
+	if resetErr != nil {
+		u.markUnhealthy(s, resetErr)
+		return resetErr
 	}
 	u.markHealthy(s)
 	u.release(s)
@@ -160,20 +170,78 @@ func (u *jobUsers) removeScheduled(ctx context.Context, s *jobUserSlot) error {
 	if res.ExitCode != 0 && !strings.Contains(strings.ToLower(res.Output), "no crontab") {
 		return fmt.Errorf("crontab -r -u %s exited %d: %s", s.name, res.ExitCode, strings.TrimSpace(res.Output))
 	}
-	// atq fails on a Mac where the at facility is not turned on, which is how
-	// macOS ships; then there is nothing to remove.
-	q, err := u.sys.Run(ctx, jobUserCommand{Argv: []string{"/usr/bin/atq"}})
-	if err != nil || q.ExitCode != 0 {
-		return nil
+	// An at job is a file in the spool owned by whoever queued it. atq on macOS
+	// prints no owner at all, even to root, so the spool is read instead: the
+	// owner there is the kernel's record, which a job cannot change. Neither
+	// follows a link nor leaves the spool's own volume.
+	if _, err := u.run(ctx, "/usr/bin/find", "-x", "-P", jobUserAtSpool, "-maxdepth", "1", "-type", "f", "-user", strconv.Itoa(s.uid), "-delete"); err != nil {
+		return err
 	}
-	for _, line := range strings.Split(q.Output, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 2 || f[len(f)-1] != s.name {
-			continue
+	return nil
+}
+
+// jobUserAtSpool is where macOS's at keeps queued jobs, one file per job.
+const jobUserAtSpool = "/private/var/at/jobs"
+
+// pathWithin says whether p is base or something under it, by whole names, so
+// that /Users/zj01 does not claim /Users/zj010.
+func pathWithin(base, p string) bool {
+	base, p = filepath.Clean(base), filepath.Clean(p)
+	return p == base || strings.HasPrefix(p, base+"/")
+}
+
+// unmountJobMounts takes off every filesystem the job left mounted, before the
+// home is moved. A disk image attached with its mount point in the home goes
+// with the folder that holds it, and would then be deleted through; and one
+// attached elsewhere, such as under /Volumes or /private/tmp, outlives the job
+// and every cleaned tree. What is taken is whatever is mounted at or under the
+// slot's home, whoever mounted it, and whatever the slot's UID mounted anywhere,
+// which the kernel records and a job cannot change. The table is read from the
+// kernel, never parsed from the output of mount, because a mount point's name is
+// the job's to choose.
+func (u *jobUsers) unmountJobMounts(ctx context.Context, s *jobUserSlot) error {
+	home := u.home(s)
+	return u.unmountWhere(ctx, func(m jobUserMount) bool {
+		return pathWithin(home, m.Path) || m.Owner == s.uid
+	})
+}
+
+// unmountWhere unmounts the mounts that match, the deepest first, each with
+// umount -f and then, if that fails, diskutil, and says if any is still there.
+func (u *jobUsers) unmountWhere(ctx context.Context, match func(jobUserMount) bool) error {
+	matching := func() ([]string, error) {
+		mounts, err := u.sys.Mounts()
+		if err != nil {
+			return nil, fmt.Errorf("reading the mount table: %w", err)
 		}
-		if _, err := u.run(ctx, "/usr/bin/atrm", f[0]); err != nil {
-			return err
+		var paths []string
+		for _, m := range mounts {
+			if match(m) {
+				paths = append(paths, m.Path)
+			}
 		}
+		// A mount under another has a longer path, and the outer one is busy until
+		// the inner one has gone.
+		sort.Slice(paths, func(i, j int) bool { return len(paths[i]) > len(paths[j]) })
+		return paths, nil
+	}
+	paths, err := matching()
+	if err != nil || len(paths) == 0 {
+		return err
+	}
+	for _, p := range paths {
+		if _, err := u.run(ctx, "/sbin/umount", "-f", p); err != nil {
+			if _, err2 := u.run(ctx, "/usr/sbin/diskutil", "unmount", "force", p); err2 != nil {
+				return fmt.Errorf("could not unmount %s (umount: %v; diskutil: %v)", p, err, err2)
+			}
+		}
+	}
+	left, err := matching()
+	if err != nil {
+		return err
+	}
+	if len(left) > 0 {
+		return fmt.Errorf("%s is still mounted after it was unmounted", left[0])
 	}
 	return nil
 }
@@ -184,9 +252,11 @@ func (u *jobUsers) removeScheduled(ctx context.Context, s *jobUserSlot) error {
 func (u *jobUsers) replaceHome(ctx context.Context, s *jobUserSlot) error {
 	home := u.home(s)
 	if _, err := u.sys.Lstat(home); err == nil {
-		// A job can set flags that stop root removing its files, and a flag on a
-		// file inside the home would stop the trash being emptied.
-		if _, err := u.run(ctx, "/usr/bin/chflags", "-R", "nouchg,noschg", home); err != nil {
+		// A job can set flags that stop root removing or renaming its files, any of
+		// them (uchg, schg, uappnd, sappnd), and a flag on a file inside the home
+		// would stop the trash being emptied. They are all cleared, by value, and
+		// not as a list of the ones somebody thought of.
+		if _, err := u.run(ctx, "/usr/bin/chflags", "-R", "0", home); err != nil {
 			return err
 		}
 		if err := u.sys.MkdirAll(u.trashDir, 0o700); err != nil {
@@ -251,10 +321,20 @@ func (u *jobUsers) userTempDir(ctx context.Context, s *jobUserSlot) (string, err
 	return strings.TrimSpace(out), nil
 }
 
+// jobUserCleanedTrees are the places outside a home that a job can write to and
+// the reset cleans: what the slot's UID owns in them is removed, and checked to be
+// gone. /Library/Caches is there because a job can write to it when it is
+// world-writable, which is how it is on the Macs this was written for; where it
+// is not, the job owns nothing in it and cleaning it does nothing. The list is
+// one variable, so that the cleaning, the check and the documentation cannot
+// disagree about it. The users' shared folder, whose place depends on the
+// configuration, is added by sharedTrees.
+var jobUserCleanedTrees = []string{"/private/tmp", "/private/var/tmp", "/Library/Caches"}
+
 // sharedTrees are the places on a standard install where any account can leave
 // files, beside its own home.
 func (u *jobUsers) sharedTrees() []string {
-	return []string{"/private/tmp", "/private/var/tmp", filepath.Join(u.usersDir, "Shared")}
+	return append(append([]string(nil), jobUserCleanedTrees...), filepath.Join(u.usersDir, "Shared"))
 }
 
 // removeSharedFiles removes what the UID owns in the shared trees. find does

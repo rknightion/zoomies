@@ -3,8 +3,9 @@ package backend
 // The egress check before every job. It is the VM backend's, with the slot user
 // standing where the guest does: each must-allow target must connect as the
 // slot user, and each must-block target must first be reachable from the agent
-// itself and then time out as the slot user. A refusal or a connection is a
-// breach, because it means packets got there.
+// itself and then time out, or be refused as unreachable, as the slot user. A
+// refusal by the target or a connection is a breach, because it means packets
+// got there.
 
 import (
 	"context"
@@ -33,6 +34,8 @@ func newJobUserGate(u *jobUsers, dial func(ctx context.Context, address string) 
 		the:    "the job user",
 		a:      "a job user",
 		log:    u.log,
+
+		unreachableBlocks: true,
 	}
 }
 
@@ -87,18 +90,24 @@ func (u *jobUsers) checkEgress(ctx context.Context, s *jobUserSlot) error {
 	u.reprobe.Store(true)
 	u.log.Error("the egress check failed", "slot", s.name, "breach", failure.Breach, "reason", failure.Reason)
 	if failure.Breach {
-		u.stopRunning(ctx)
+		u.stopAllSlots(ctx)
 	}
 	return &jobUserEgressError{failure: failure}
 }
 
-// stopRunning kills every process of every job user, so that each runner exits
-// through the normal path and its slot is cleaned. It is the counterpart of the
-// VM backend deleting its clones after a breach: a job that was admitted under a
-// policy since shown not to hold is not trusted to finish.
-func (u *jobUsers) stopRunning(ctx context.Context) {
+// stopAllSlots kills every process of every job user that exists, offered or
+// not, so that each runner exits through the normal path and its slot is cleaned.
+// It is the counterpart of the VM backend deleting its clones after a breach: a
+// job that was admitted under a policy since shown not to hold is not trusted to
+// finish, and one in an account above a reduced capacity, adopted after a
+// restart, is no exception. It also counts the stop, which a create that has
+// passed its checks reads before it starts its runner.
+func (u *jobUsers) stopAllSlots(ctx context.Context) {
+	u.startMu.Lock()
+	u.stopGen++
+	u.startMu.Unlock()
 	ctx = context.WithoutCancel(ctx)
-	for _, s := range u.offered() {
+	for _, s := range u.covered() {
 		if err := u.stopProcesses(ctx, s); err != nil {
 			u.log.Warn("could not stop a job user's processes after the firewall failed", "slot", s.name, "error", err)
 		}

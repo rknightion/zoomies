@@ -34,11 +34,12 @@ account being cleaned never keeps a new job waiting. For each job it:
 
 When the job ends, the agent keeps the runner's `_diag` folder, resets the
 account and gives it back. The reset stops every process of the account, boots
-out its launchd domains, removes its cron and `at` jobs, moves its home aside
-(the trash is emptied later, off the next job's path) and makes a new one,
-removes its per-user temporary folder, its files in `/private/tmp`,
-`/private/var/tmp` and `/Users/Shared`, and its shared memory and semaphores,
-and then checks that nothing is left. A reset that fails takes the account out of
+out its launchd domains, removes its cron and `at` jobs, unmounts anything the
+job mounted, clears every file flag and moves its home aside (the trash is emptied
+later, off the next job's path, and never through a mounted filesystem) and makes a
+new one, removes its per-user temporary folder, its files in `/private/tmp`,
+`/private/var/tmp`, `/Library/Caches` and `/Users/Shared`, and its shared memory
+and semaphores, and then checks that nothing is left. A reset that fails takes the account out of
 service and the Hosts page says which and why; the agent tries it again after a minute, after
 five more, and then every fifteen, so a passing cause clears itself.
 
@@ -74,11 +75,11 @@ do not allow public repositories or forks you do not trust.
 | --- | --- |
 | The agent's credentials and configuration | Out of reach: they are root's, mode 0600 and 0700, and the agent refuses to start if they are not. Each job account has a primary group of its own, because every local account is otherwise in `staff` and macOS homes are readable by that group. |
 | Another job's files | Out of reach while it runs (the homes are 0700 and the accounts are different), and gone after it: the home, temporary folders, launchd jobs, keychains and shared memory are wiped. |
-| The network | Blocked to the LAN, the tailnet, link-local addresses and every address of the host itself except loopback, for these accounts only. The public internet stays open. |
+| The network | Blocked to the LAN, the tailnet, link-local addresses and every address of the host itself except loopback, for these accounts only; and all IPv6 except `::1`. The public IPv4 internet stays open. |
 | A job's own servers on 127.0.0.1 | Work. A job can also reach services listening on loopback or on all addresses, so keep such services on unix sockets with owner-only permissions, or add their ports to `egress_must_block`. |
 | World-readable files anywhere on the disk | **Readable.** Nothing secret may be world-readable on a host in this mode. |
 | CPU, memory and disk | **No limits.** macOS has nothing like cgroups; the number of accounts is the only control. |
-| Files left in other world-writable places, and POSIX shared memory | Not cleaned. On a standard install the cleaned trees are the world-writable ones; POSIX shared memory lasts until reboot. |
+| Files left in other world-writable places, and POSIX shared memory | Not cleaned. The trees that are cleaned are the world-writable ones on a stock install we checked (`/private/tmp`, `/private/var/tmp` and `/Users/Shared`), and `/Library/Caches`, which is cleaned because a job can write there where it is world-writable. To see what else on your Mac is, run `find / -xdev -type d -perm -0002`. POSIX shared memory lasts until reboot. |
 | Kernel or set-user-ID exploits | Not defended. |
 | The agent itself | It is a root process. It makes only outbound connections and has no listener. A bug in it is root on the host. |
 
@@ -104,9 +105,21 @@ match only the job accounts. They block outbound traffic to:
 
 * IPv4 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` and
   `169.254.0.0/16`;
-* IPv6 `fc00::/7` and `fe80::/10`;
+* all IPv6 except `::1`, because on a dual-stack network every other host has a
+  global address as well, which no list of private ranges would cover. A job has
+  the IPv4 internet and no IPv6 beyond loopback;
 * the host's own addresses on every interface but loopback, written as
   `(name)` so that pf follows an address that changes.
+
+The rules name every job account that exists on the Mac, not only the ones offered
+to new jobs. If you lower `agent.capacity` while jobs run and restart the agent, a
+job in an account above the new capacity keeps its rules, is stopped with the rest
+if the firewall is lost, and has its account cleaned when it ends. That account is
+then never offered again.
+
+Name lookups go through the system resolver (`mDNSResponder`), which is not a
+job's process and is not affected. A job tool that sends DNS itself, to a resolver
+on the LAN or the tailnet, is blocked like any other traffic to those ranges.
 
 The agent compares the loaded rules with what it wrote before every job and every
 sixty seconds, and renders them again when the interfaces change. If the anchor is
@@ -116,10 +129,16 @@ processes, holds the host for ten minutes and says so on the Hosts page.
 Before every job it also runs the same egress check the VM mode does, as the
 account the job will use: each `egress_must_allow` target must connect, and each
 `egress_must_block` target must first be reachable from the agent itself and then
-time out as the account. A connection or a refusal is a breach, and holds the host
-and stops every job. If three runners in a row exit without taking a job, the host
-is held for 10, 20, 40 and then 60 minutes, which bounds a storm of failed
-registrations.
+time out as the account, or fail with "no route" (the kernel's own answer for a
+packet the firewall drops). The account runs on the same host over the same routes
+as the agent, so the firewall is the only difference between the two. A connection
+or a refusal by the target is a breach, and holds the host and stops every job. A
+job that the firewall check passed, but that was being made when the firewall was
+found lost, is not started.
+
+The VM mode also holds a host when three runners in a row exit without taking a
+job. That breaker is not used here: nothing outside the job's own home can show
+that a runner took a job, and a job can delete the evidence inside it.
 
 ## Enrolling a Mac
 
@@ -153,9 +172,12 @@ as root and starts every job from that file.
    `platform: macos/arm64` and a `host_selector` of `isolation=user`.
 
 Capacity is `agent.capacity`, at most 47. The host has one account more than that,
-and the agent makes them when it starts: it refuses to start if an account called
-`zjNN` exists with another UID or primary group, or if a UID from 651 to 698
-belongs to an account it did not make, so it never adopts a person's account.
+and the agent makes them when it starts. The accounts have the login shell
+`/usr/bin/false`, so nobody can log in as one, and an existing account with another
+shell is corrected (a job still gets `SHELL=/bin/zsh` in its environment). The agent
+refuses to start if an account called `zjNN` exists with another UID, primary group
+or home folder than `/Users/zjNN`, or is a member of `admin`, or if a UID from 651
+to 698 belongs to an account it did not make, so it never adopts a person's account.
 The group is `_zjobs` (GID 650).
 
 The controller leaves the capacity of this host alone: it is sized by the accounts,

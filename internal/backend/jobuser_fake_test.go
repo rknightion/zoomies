@@ -31,6 +31,11 @@ type fakeJobUsers struct {
 	users   map[string]int
 	groups  map[string]int
 	groupOf map[string]int
+	// shellOf, homeOf and admins are what dscl and dseditgroup say of an account;
+	// an account not named here has the shell, home and standing Zoomies gives.
+	shellOf map[string]string
+	homeOf  map[string]string
+	admins  map[string]bool
 	procs   []jobUserProc
 	// stubborn keeps every process alive through pkill, so a reset has to give up.
 	stubborn bool
@@ -51,6 +56,14 @@ type fakeJobUsers struct {
 	// probe answers the egress probe: by default every must-allow target connects
 	// and every other one times out.
 	probe func(targets []string) []string
+	// mounts is the mount table, and devs says which filesystem a path is on: a
+	// path not in it is on filesystem 1. Unmounting removes a mount and what it
+	// held from both.
+	mounts []jobUserMount
+	devs   map[string]uint64
+	// onRun is called after every command, outside the fake's lock, so a test
+	// can have the host change under the code that is running a command.
+	onRun func(c jobUserCommand)
 }
 
 type fakeRule struct {
@@ -75,6 +88,10 @@ func newFakeJobUsers(t *testing.T) *fakeJobUsers {
 		users:    map[string]int{"root": 0, "alice": 501},
 		groups:   map[string]int{"staff": 20, "wheel": 0},
 		groupOf:  map[string]int{},
+		shellOf:  map[string]string{},
+		homeOf:   map[string]string{},
+		admins:   map[string]bool{},
+		devs:     map[string]uint64{},
 		pfToken:  41,
 		ifaces:   []jobUserIface{{Name: "lo0", HasAddr: true}, {Name: "en0", HasAddr: true}, {Name: "utun3", HasAddr: true}, {Name: "bridge0"}},
 		owners:   map[string][2]int{},
@@ -186,6 +203,17 @@ func hasPrefix(argv, prefix []string) bool {
 }
 
 func (f *fakeJobUsers) Run(_ context.Context, c jobUserCommand) (jobUserResult, error) {
+	res, err := f.run(c)
+	f.mu.Lock()
+	hook := f.onRun
+	f.mu.Unlock()
+	if hook != nil {
+		hook(c)
+	}
+	return res, err
+}
+
+func (f *fakeJobUsers) run(c jobUserCommand) (jobUserResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cmds = append(f.cmds, c)
@@ -225,6 +253,20 @@ func (f *fakeJobUsers) defaultRun(c jobUserCommand) jobUserResult {
 			return jobUserResult{Output: listIDs(f.groups)}
 		case arg(2) == "-read":
 			name := strings.TrimPrefix(arg(3), "/Users/")
+			switch arg(4) {
+			case "UserShell":
+				sh, set := f.shellOf[name]
+				if !set {
+					sh = jobUserLoginShell
+				}
+				return jobUserResult{Output: "UserShell: " + sh + "\n"}
+			case "NFSHomeDirectory":
+				home, set := f.homeOf[name]
+				if !set {
+					home = filepath.Join(f.usersDir, name)
+				}
+				return jobUserResult{Output: "NFSHomeDirectory: " + home + "\n"}
+			}
 			g, set := f.groupOf[name]
 			if !set {
 				g = 20
@@ -236,8 +278,30 @@ func (f *fakeJobUsers) defaultRun(c jobUserCommand) jobUserResult {
 		case arg(2) == "-create" && strings.HasPrefix(arg(3), "/Users/") && arg(4) == "PrimaryGroupID":
 			n, _ := strconv.Atoi(arg(5))
 			f.groupOf[strings.TrimPrefix(arg(3), "/Users/")] = n
+		case arg(2) == "-create" && strings.HasPrefix(arg(3), "/Users/") && arg(4) == "UserShell":
+			f.shellOf[strings.TrimPrefix(arg(3), "/Users/")] = arg(5)
 		case arg(2) == "-delete" && strings.HasPrefix(arg(3), "/Groups/"):
 			delete(f.groups, strings.TrimPrefix(arg(3), "/Groups/"))
+		}
+	case "dseditgroup":
+		// dseditgroup -o checkmember -m NAME admin
+		if f.admins[arg(4)] {
+			return jobUserResult{Output: "yes " + arg(4) + " is a member of " + arg(5) + "\n"}
+		}
+		return jobUserResult{ExitCode: 67, Output: "no " + arg(4) + " is NOT a member of " + arg(5) + "\n"}
+	case "umount", "diskutil":
+		path := argv[len(argv)-1]
+		kept := f.mounts[:0:0]
+		for _, m := range f.mounts {
+			if m.Path != path {
+				kept = append(kept, m)
+			}
+		}
+		f.mounts = kept
+		for p := range f.devs {
+			if p == path || strings.HasPrefix(p, path+"/") {
+				delete(f.devs, p)
+			}
 		}
 	case "sysadminctl":
 		switch arg(1) {
@@ -245,6 +309,16 @@ func (f *fakeJobUsers) defaultRun(c jobUserCommand) jobUserResult {
 			uid, _ := strconv.Atoi(arg(4))
 			f.users[arg(2)] = uid
 			f.groupOf[arg(2)] = 20
+			// sysadminctl's own default, unless it is told otherwise.
+			f.shellOf[arg(2)] = "/bin/zsh"
+			for i, a := range argv {
+				switch {
+				case a == "-shell" && i+1 < len(argv):
+					f.shellOf[arg(2)] = argv[i+1]
+				case a == "-home" && i+1 < len(argv):
+					f.homeOf[arg(2)] = argv[i+1]
+				}
+			}
 		case "-deleteUser":
 			delete(f.users, arg(2))
 		}
@@ -411,6 +485,21 @@ func (f *fakeJobUsers) ReadFile(path string, max int64) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
+func (f *fakeJobUsers) Dev(path string, _ fs.FileInfo) (uint64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if d, ok := f.devs[path]; ok {
+		return d, true
+	}
+	return 1, true
+}
+
+func (f *fakeJobUsers) Mounts() ([]jobUserMount, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]jobUserMount(nil), f.mounts...), nil
+}
+
 func (f *fakeJobUsers) Processes(context.Context) ([]jobUserProc, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -494,6 +583,24 @@ func buildJobUserFixture(t *testing.T, f *fakeJobUsers, root, state string, capa
 	}
 	t.Cleanup(b.Close)
 	return &jobUserFixture{b: b, u: b.jobUsers, f: f, root: root, state: state}
+}
+
+// startedJobUserFixtureWithAccounts is startedJobUserFixture on a Mac where the
+// first existing accounts were made already, in the group, as an earlier agent
+// with a bigger capacity would have left them.
+func startedJobUserFixtureWithAccounts(t *testing.T, capacity, existing int) *jobUserFixture {
+	t.Helper()
+	x := newJobUserFixture(t, capacity)
+	x.f.groups[jobUserGroup] = jobUserGID
+	for n := 1; n <= existing; n++ {
+		x.f.users[jobUserName(n)] = jobUserUID(n)
+		x.f.groupOf[jobUserName(n)] = jobUserGID
+	}
+	if err := x.b.StartJobUsers(context.Background()); err != nil {
+		t.Fatalf("StartJobUsers: %v", err)
+	}
+	x.f.reset()
+	return x
 }
 
 // startedFixture is newJobUserFixture after StartJobUsers.

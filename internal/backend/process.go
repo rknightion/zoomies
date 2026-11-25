@@ -717,10 +717,6 @@ func (b *ProcessBackend) Stop(ctx context.Context, h Handle, timeout time.Durati
 	if timeout <= 0 {
 		timeout = defaultStopTimeout
 	}
-	if b.jobUsers != nil {
-		b.jobUsers.noteStop(dir)
-	}
-
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return nil
@@ -824,7 +820,9 @@ func (b *ProcessBackend) wipe(ctx context.Context, dir string) error {
 	}
 
 	if b.jobUsers != nil {
-		b.finishJobUser(ctx, dir)
+		if err := b.finishJobUser(ctx, dir); err != nil {
+			return err
+		}
 	}
 
 	if err := removeAllRetry(ctx, dir, removeGrace, os.RemoveAll); err != nil {

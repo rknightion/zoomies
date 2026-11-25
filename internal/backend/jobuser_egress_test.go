@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -172,5 +175,124 @@ func TestAnUncleanSlotIsResetAndAnUncleanableOneIsSkipped(t *testing.T) {
 	}
 	if got := x.u.unhealthy(); len(got) != 1 || !strings.Contains(got[0], fmt.Sprint("zj02")) {
 		t.Errorf("unhealthy = %v", got)
+	}
+}
+
+func TestAMustBlockTargetThatIsUnreachableFromTheJobUserAloneCountsAsBlocked(t *testing.T) {
+	// The agent reached the target over the same routes, so the firewall is the
+	// only difference between the two. pf can answer a packet it blocks with an
+	// error from the kernel as well as with silence.
+	x := startedJobUserFixture(t, 1)
+	x.f.probe = func(targets []string) []string {
+		out := make([]string, len(targets))
+		for i, tg := range targets {
+			out[i] = vmpalEgressUnreachable
+			if strings.HasPrefix(tg, "github") {
+				out[i] = vmpalEgressConnected
+			}
+		}
+		return out
+	}
+	if _, err := x.u.admit(context.Background(), "runner-dir"); err != nil {
+		t.Fatalf("a must-block target the agent reached and the job user got EHOSTUNREACH for was not read as blocked: %v", err)
+	}
+	if x.u.state.held() != nil {
+		t.Error("the host was held for a firewall that works")
+	}
+
+	// A target the agent cannot reach proves nothing, whatever the job user gets.
+	y := startedJobUserFixture(t, 1, func(o *JobUserOptions) {
+		o.EgressDial = func(context.Context, string) error { return errors.New("no route") }
+	})
+	y.f.probe = x.f.probe
+	_, err := y.u.admit(context.Background(), "runner-dir")
+	var egress *jobUserEgressError
+	if !errors.As(err, &egress) || egress.failure.Breach {
+		t.Fatalf("admit = %v; want a check that could not tell", err)
+	}
+}
+
+func TestANetworkErrorOtherThanUnreachableStillFailsTheCheck(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	x.f.probe = func(targets []string) []string {
+		out := make([]string, len(targets))
+		for i, tg := range targets {
+			out[i] = vmpalEgressError
+			if strings.HasPrefix(tg, "github") {
+				out[i] = vmpalEgressConnected
+			}
+		}
+		return out
+	}
+	_, err := x.u.admit(context.Background(), "runner-dir")
+	var egress *jobUserEgressError
+	if !errors.As(err, &egress) || egress.failure.Breach || !strings.Contains(err.Error(), "rather than timing out") {
+		t.Fatalf("admit = %v; want a doubt about an error that is neither a timeout nor unreachable", err)
+	}
+}
+
+func TestABreachStopsTheJobsOfEveryAccountThatExistsAndNotOnlyTheOfferedOnes(t *testing.T) {
+	// Capacity 1 offers zj01 and zj02; zj04 and zj05 are what a bigger capacity
+	// left, and a job that survived an agent restart can be running as one.
+	x := startedJobUserFixtureWithAccounts(t, 1, 5)
+	x.f.probe = func(targets []string) []string {
+		out := make([]string, len(targets))
+		for i := range out {
+			out[i] = vmpalEgressConnected
+		}
+		return out
+	}
+	x.f.procs = []jobUserProc{{PID: 700, RUID: 654, EUID: 654}, {PID: 701, RUID: 655, EUID: 655}, {PID: 702, RUID: 501, EUID: 501}}
+	_, err := x.u.admit(context.Background(), "runner-dir")
+	var egress *jobUserEgressError
+	if !errors.As(err, &egress) || !egress.failure.Breach {
+		t.Fatalf("admit = %v; want a breach", err)
+	}
+	if len(x.f.procs) != 1 || x.f.procs[0].PID != 702 {
+		t.Errorf("processes left = %v; want only the person's, at UID 501", x.f.procs)
+	}
+}
+
+func TestALostFirewallStopsTheJobsOfEveryAccountThatExists(t *testing.T) {
+	x := startedJobUserFixtureWithAccounts(t, 1, 5)
+	x.f.procs = []jobUserProc{{PID: 700, RUID: 654, EUID: 654}, {PID: 701, RUID: 655, EUID: 655}, {PID: 702, RUID: 501, EUID: 501}}
+	x.f.pfRules = ""
+	x.u.watchOnce(context.Background())
+	if len(x.f.procs) != 1 || x.f.procs[0].PID != 702 {
+		t.Errorf("processes left = %v; want only the person's, at UID 501", x.f.procs)
+	}
+}
+
+func TestACreatePastTheFirewallCheckDoesNotStartWhenTheHostIsHeldAfterwards(t *testing.T) {
+	x := startedJobUserFixture(t, 1)
+	ctx := context.Background()
+	fired := false
+	x.f.mu.Lock()
+	x.f.onRun = func(c jobUserCommand) {
+		// The create's egress check: its last question is the must-block target,
+		// asked as the job user. The watcher finds the firewall gone just then.
+		if fired || !c.AsUser || !slices.Contains(c.Argv, "198.51.100.10:443") {
+			return
+		}
+		fired = true
+		x.u.firewallLost(ctx, errors.New("flushed behind the agent's back"))
+	}
+	x.f.mu.Unlock()
+
+	_, err := x.b.CreateWithResult(ctx, jobUserSpec("runner-a"))
+	if !fired {
+		t.Fatal("the test never reached the egress check")
+	}
+	if !errors.Is(err, errJobUsersHeld) {
+		t.Fatalf("create = %v; want the hold that started while it was being made", err)
+	}
+	if len(x.f.started) != 0 {
+		t.Error("a runner was started after the firewall was found lost, so it would run unwatched until the next pass")
+	}
+	if x.u.slotNamed("zj01").holder != "" {
+		t.Error("the slot stayed reserved")
+	}
+	if entries, _ := os.ReadDir(filepath.Join(x.root, runnersDirName)); len(entries) != 0 {
+		t.Errorf("%d records left", len(entries))
 	}
 }

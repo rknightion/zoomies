@@ -81,7 +81,9 @@ func (b *ProcessBackend) StartJobUsers(ctx context.Context) error {
 		return err
 	}
 	b.adoptJobUserRecords()
-	for _, s := range u.offered() {
+	// Every account that exists, not only those offered: one above a capacity that
+	// was lowered holds nothing now, and nothing says what was left in it.
+	for _, s := range u.covered() {
 		u.mu.Lock()
 		busy := s.holder != ""
 		u.mu.Unlock()
@@ -108,6 +110,16 @@ func (b *ProcessBackend) StartJobUsers(ctx context.Context) error {
 // adoptJobUserRecords rebuilds which slot each runner holds from the records on
 // disk, so a restarted agent neither offers a busy slot nor loses the one its
 // running job will need cleaned.
+//
+// Two records can name one slot, when an agent died between giving a slot back
+// and deleting the record, or a record could not be deleted. The slot belongs to
+// the record whose runner process is alive, because that is the job using the
+// account; with none alive, the first. The record that loses has its claim
+// cleared, so that cleaning it up later can never reset an account that is not
+// its own.
+//
+// A slot above the capacity now set is adopted all the same, and drains: it is
+// never offered again, and it is cleaned when its job ends.
 func (b *ProcessBackend) adoptJobUserRecords() {
 	u := b.jobUsers
 	root := filepath.Join(b.root, runnersDirName)
@@ -115,6 +127,11 @@ func (b *ProcessBackend) adoptJobUserRecords() {
 	if err != nil {
 		return
 	}
+	type claim struct {
+		dir  string
+		meta processMeta
+	}
+	claims := make(map[string][]claim)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -124,19 +141,74 @@ func (b *ProcessBackend) adoptJobUserRecords() {
 		if err != nil || meta.Slot == "" {
 			continue
 		}
-		s := u.slotNamed(meta.Slot)
-		if s == nil {
+		if u.slotNamed(meta.Slot) == nil {
 			b.log.Warn("a runner record names a job user this agent has no slot for", "dir", dir, "slot", meta.Slot)
 			continue
 		}
-		u.mu.Lock()
-		if s.holder != "" && s.holder != dir {
-			b.log.Warn("two runner records name the same job user; the first keeps it", "slot", s.name, "dir", dir, "holder", s.holder)
-		} else {
-			s.holder = dir
-		}
-		u.mu.Unlock()
+		claims[meta.Slot] = append(claims[meta.Slot], claim{dir, meta})
 	}
+	for _, s := range u.slots {
+		cs := claims[s.name]
+		if len(cs) == 0 {
+			continue
+		}
+		winner := 0
+		for i, c := range cs {
+			if runnerProcessAlive(c.dir, c.meta) {
+				winner = i
+				break
+			}
+		}
+		u.mu.Lock()
+		s.holder = cs[winner].dir
+		u.mu.Unlock()
+		if !s.offered {
+			b.log.Info("a job is still running in a job user above the capacity now set; it is cleaned when the job ends and is not offered again", "slot", s.name, "dir", cs[winner].dir)
+		}
+		for i, c := range cs {
+			if i == winner {
+				continue
+			}
+			b.log.Warn("two runner records name the same job user; the slot goes to the one whose runner is running, or the first", "slot", s.name, "dir", c.dir, "holder", cs[winner].dir)
+			if err := clearSlotClaim(c.dir); err != nil {
+				b.log.Warn("could not clear the claim of a runner record that lost its job user", "dir", c.dir, "error", err)
+			}
+		}
+	}
+}
+
+// runnerProcessAlive says whether the runner a record describes is running: its
+// process exists and is the one the record was written for, not a process that
+// has since been given the same number.
+func runnerProcessAlive(dir string, meta processMeta) bool {
+	pid := readPID(dir)
+	return pid > 0 && processAlive(pid) && verifyProcessIdentity(meta, pid) == nil
+}
+
+// clearSlotClaim takes the job user out of a runner's record, so that nothing
+// that reads the record afterwards takes the account for its own. If the record
+// cannot be rewritten it is deleted: a record with no metadata is not a claim on
+// anything, and is cleaned up as an abandoned folder.
+func clearSlotClaim(dir string) error {
+	meta, err := readMeta(dir)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if meta.Slot == "" {
+		return nil
+	}
+	meta.Slot = ""
+	werr := writeMeta(dir, meta)
+	if werr == nil {
+		return nil
+	}
+	if rerr := os.Remove(filepath.Join(dir, runnerMetaFile)); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+		return fmt.Errorf("could not rewrite the record in %s (%v) or delete it: %w", dir, werr, rerr)
+	}
+	return nil
 }
 
 // probeJobUsers is Probe in job-user mode.
@@ -233,13 +305,10 @@ func (b *ProcessBackend) createJobUser(ctx context.Context, spec Spec, started t
 		return CreateResult{}, fmt.Errorf("backend: giving the runner in %s to %s: %w", runDir, slot.name, err)
 	}
 
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return CreateResult{}, fmt.Errorf("backend: creating the runner record %s: %w", dir, err)
-	}
 	// The registration is in the environment only, as in the plain backend, and
 	// never touches disk.
 	env := jobUserEnv(slot, u.home(slot), tmp, spec)
-	if err := b.startRunner(dir, runDir, slot, []string{"run"}, env, spec, version); err != nil {
+	if err := b.startAdmitted(dir, runDir, slot, env, spec, version); err != nil {
 		_ = os.RemoveAll(dir)
 		return CreateResult{}, err
 	}
@@ -248,11 +317,38 @@ func (b *ProcessBackend) createJobUser(ctx context.Context, spec Spec, started t
 	return CreateResult{Handle: Handle(dir), CreateDuration: time.Since(started)}, nil
 }
 
+// startAdmitted makes the runner's record and starts the runner, after one last
+// look at whether the host was held or every job was stopped since this create
+// was admitted. The look and the start are under one lock, which stopping every
+// job takes too: a runner that is started before the stop is killed by it, and
+// one that would start after it is not started, so a create that passed its
+// firewall check a moment before the firewall was found lost cannot run
+// unwatched until the next pass.
+func (b *ProcessBackend) startAdmitted(dir, runDir string, slot *jobUserSlot, env []string, spec Spec, version string) error {
+	u := b.jobUsers
+	u.startMu.RLock()
+	defer u.startMu.RUnlock()
+	if err := u.state.held(); err != nil {
+		return err
+	}
+	if u.stopGen != slot.admitGen {
+		return fmt.Errorf("%w: every job on this Mac was stopped while this runner was being made, so it was not started", errJobUsersHeld)
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("backend: creating the runner record %s: %w", dir, err)
+	}
+	return b.startRunner(dir, runDir, slot, []string{"run"}, env, spec, version)
+}
+
 // admit reserves a slot and proves the host is fit to run a job in it: the slot
 // is clean, the firewall is in force and the egress check passes as that
 // account. A slot that cannot be cleaned is taken out of service and the next is
-// tried; a firewall that fails holds the whole host.
+// tried; a firewall that fails holds the whole host. It records the stop count it
+// began under in the slot, for startAdmitted to compare.
 func (u *jobUsers) admit(ctx context.Context, holder string) (*jobUserSlot, error) {
+	u.startMu.RLock()
+	gen := u.stopGen
+	u.startMu.RUnlock()
 	if err := u.state.held(); err != nil {
 		return nil, err
 	}
@@ -274,33 +370,44 @@ func (u *jobUsers) admit(ctx context.Context, holder string) (*jobUserSlot, erro
 			u.release(s)
 			return nil, err
 		}
+		s.admitGen = gen
 		return s, nil
 	}
 }
 
-// noteStop records that the agent asked a runner to stop, so that the breaker
-// does not count its exit as a runner that failed to take a job.
-func (u *jobUsers) noteStop(dir string) {
-	u.mu.Lock()
-	u.stopped[dir] = true
-	u.mu.Unlock()
-}
-
 // finishJobUser is what removing a job-user runner adds to removing a plain one:
 // keep the diagnostics, clean the account and give the slot back. It runs after
-// the runner has stopped and its exit has been recorded, and it never fails the
-// removal: a slot that could not be cleaned is out of service and retried, and
-// the runner is gone either way.
-func (b *ProcessBackend) finishJobUser(ctx context.Context, dir string) {
+// the runner has stopped and its exit has been recorded. A slot that could not be
+// cleaned does not fail the removal: it is out of service and retried, and the
+// runner is gone either way.
+//
+// It acts on the slot only if this record's directory is the slot's holder. A
+// record that names a slot another runner holds, or nobody does, is a leftover,
+// and resetting the account would kill a live job and wipe its home; that record
+// has its claim cleared and nothing else done. And the claim is cleared from the
+// record before the slot is given back, whether the reset worked or not, because
+// once it is free the next create can take it, and a record that still named it
+// would be a claim on somebody else's job. If the claim cannot be cleared the
+// slot is not given back and the removal fails, to be tried again, with the slot
+// still this record's.
+func (b *ProcessBackend) finishJobUser(ctx context.Context, dir string) error {
 	u := b.jobUsers
 	meta, err := readMeta(dir)
 	if err != nil || meta.Slot == "" {
-		return
+		return nil
 	}
 	s := u.slotNamed(meta.Slot)
 	if s == nil {
 		b.log.Warn("a runner record names a job user this agent has no slot for", "dir", dir, "slot", meta.Slot)
-		return
+		return nil
+	}
+	u.mu.Lock()
+	mine := s.holder == dir
+	holder := s.holder
+	u.mu.Unlock()
+	if !mine {
+		b.log.Warn("a runner record names a job user it does not hold, so the account is left alone", "dir", dir, "slot", s.name, "holder", holder)
+		return clearSlotClaim(dir)
 	}
 	ctx = context.WithoutCancel(ctx)
 	// Nothing of the job may still be running while its folder is read as root:
@@ -309,18 +416,17 @@ func (b *ProcessBackend) finishJobUser(ctx context.Context, dir string) {
 		b.log.Warn("could not stop what the job left running, so its diagnostics are not copied", "slot", s.name, "error", err)
 	} else {
 		keep := filepath.Join(b.root, jobUserDiagDir)
-		u.copyDiag(meta.RunDir, filepath.Join(keep, filepath.Base(dir)))
+		u.copyDiag(s, filepath.Join(keep, filepath.Base(dir)))
 		pruneJobUserDiag(keep, jobUserDiagKeep, b.log)
 	}
-	tookJob := u.tookJob(meta.RunDir)
-	u.mu.Lock()
-	stopped := u.stopped[dir]
-	delete(u.stopped, dir)
-	u.mu.Unlock()
-	u.state.runnerExited(tookJob, stopped)
-	if err := u.resetAndFree(ctx, s); err != nil {
+	resetErr := u.resetSlot(ctx, s)
+	if err := clearSlotClaim(dir); err != nil {
+		return fmt.Errorf("backend: the account %s was cleaned but could not be taken out of the runner's record, so it is kept for this runner until the record can be removed: %w", s.name, err)
+	}
+	if err := u.free(s, resetErr); err != nil {
 		b.log.Error("a job user could not be cleaned after its job, so it is out of service and will be retried", "slot", s.name, "error", err)
 	}
+	return nil
 }
 
 // pruneJobUserDiag deletes the oldest folders of kept diagnostics beyond keep.
@@ -347,38 +453,31 @@ func pruneJobUserDiag(dir string, keep int, log *slog.Logger) {
 	}
 }
 
-// tookJob says whether the runner ran a job, which it does if it left a worker
-// log. That is the only evidence of one that outlives the runner, and the
-// breaker counts on it.
-func (u *jobUsers) tookJob(runDir string) bool {
-	if runDir == "" {
-		return false
-	}
-	entries, err := u.sys.ReadDir(filepath.Join(runDir, "_diag"))
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "Worker_") {
-			return true
+// copyDiag keeps the runner's _diag folder, which would be lost with the home.
+// Only regular files that the slot owns are copied, 20 MB in all, and only if no
+// step of the way to them from the slot's home is a link: the folder belongs to
+// the job and is read here as root, so a link at any depth would have root copy
+// whatever it points to. Nothing of the job is running, which stopProcesses has
+// just shown, so what is looked at is what is read.
+func (u *jobUsers) copyDiag(s *jobUserSlot, dest string) {
+	src := filepath.Join(u.runDir(s), "_diag")
+	for _, step := range []string{u.home(s), u.runDir(s), src} {
+		info, err := u.sys.Lstat(step)
+		if errors.Is(err, fs.ErrNotExist) {
+			return
+		}
+		if err != nil {
+			u.log.Warn("could not look at the runner's diagnostics; the reset goes ahead", "dir", step, "error", err)
+			return
+		}
+		if !info.IsDir() {
+			u.log.Warn("the runner's diagnostics are behind a link or something that is not a folder, which only a job makes it, so they are not copied; the reset goes ahead", "path", step)
+			return
 		}
 	}
-	return false
-}
-
-// copyDiag keeps the runner's _diag folder, which would be lost with the home.
-// Only regular files are copied, found without following links, and 20 MB in
-// all, because the folder belongs to the job and is read here as root.
-func (u *jobUsers) copyDiag(runDir, dest string) {
-	if runDir == "" {
-		return
-	}
-	src := filepath.Join(runDir, "_diag")
 	entries, err := u.sys.ReadDir(src)
 	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			u.log.Warn("could not read the runner's diagnostics; the reset goes ahead", "dir", src, "error", err)
-		}
+		u.log.Warn("could not read the runner's diagnostics; the reset goes ahead", "dir", src, "error", err)
 		return
 	}
 	left := int64(jobUserDiagLimit)
@@ -387,7 +486,17 @@ func (u *jobUsers) copyDiag(runDir, dest string) {
 		if !e.Type().IsRegular() {
 			continue
 		}
-		data, err := u.sys.ReadFile(filepath.Join(src, e.Name()), left)
+		path := filepath.Join(src, e.Name())
+		// A hard link to a file of root's is a regular file in the job's folder.
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if uid, _, ok := u.sys.Owner(path, info); !ok || uid != s.uid {
+			u.log.Warn("a diagnostics file is not the job user's, so it is not copied", "file", e.Name())
+			continue
+		}
+		data, err := u.sys.ReadFile(path, left)
 		if err != nil {
 			u.log.Warn("could not copy a diagnostics file; the reset goes ahead", "file", e.Name(), "error", err)
 			continue
