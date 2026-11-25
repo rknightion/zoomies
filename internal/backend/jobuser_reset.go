@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -320,22 +321,33 @@ func (u *jobUsers) removeUserTemp(ctx context.Context, s *jobUserSlot) error {
 	for _, c := range children {
 		child := filepath.Join(parent, c.Name())
 		if !c.IsDir() {
-			if err := u.sys.RemoveAll(child); err != nil {
+			if err := u.sys.RemoveAll(child); err != nil && !closedToRoot(err) {
 				return err
 			}
 			continue
 		}
 		inside, err := u.sys.ReadDir(child)
 		if err != nil {
+			if closedToRoot(err) {
+				continue
+			}
 			return err
 		}
 		for _, e := range inside {
-			if err := u.sys.RemoveAll(filepath.Join(child, e.Name())); err != nil {
+			if err := u.sys.RemoveAll(filepath.Join(child, e.Name())); err != nil && !closedToRoot(err) {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// closedToRoot says an error is macOS refusing even root, as it does for some
+// of what it makes in a user's folder (0/com.apple.LaunchServices.dv is one).
+// A job cannot have put anything there, so it is left rather than failing the
+// reset; any other error still fails it.
+func closedToRoot(err error) bool {
+	return errors.Is(err, syscall.EPERM)
 }
 
 // userTempDir asks the system, as the slot user, for its temporary folder.

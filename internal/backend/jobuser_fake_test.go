@@ -50,8 +50,11 @@ type fakeJobUsers struct {
 	lstat map[string]fs.FileInfo
 	// readDir answers for folders that cannot exist on the machine the test runs on.
 	readDir map[string][]fs.DirEntry
-	ipcs    string
-	findOut string
+	// removeErr is what RemoveAll returns for a path, standing for one macOS
+	// will not let even root remove.
+	removeErr map[string]error
+	ipcs      string
+	findOut   string
 	// tempDir is what getconf prints.
 	tempDir string
 	started []fakeStart
@@ -84,20 +87,21 @@ type fakeStart struct {
 func newFakeJobUsers(t *testing.T) *fakeJobUsers {
 	t.Helper()
 	return &fakeJobUsers{
-		t:        t,
-		usersDir: t.TempDir(),
-		users:    map[string]int{"root": 0, "alice": 501},
-		groups:   map[string]int{"staff": 20, "wheel": 0},
-		groupOf:  map[string]int{},
-		shellOf:  map[string]string{},
-		homeOf:   map[string]string{},
-		admins:   map[string]bool{},
-		devs:     map[string]uint64{},
-		owners:   map[string][2]int{},
-		lstat:    map[string]fs.FileInfo{},
-		readDir:  map[string][]fs.DirEntry{},
-		tempDir:  "/var/folders/ab/cdef12/T/",
-		clock:    time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC),
+		t:         t,
+		usersDir:  t.TempDir(),
+		users:     map[string]int{"root": 0, "alice": 501},
+		groups:    map[string]int{"staff": 20, "wheel": 0},
+		groupOf:   map[string]int{},
+		shellOf:   map[string]string{},
+		homeOf:    map[string]string{},
+		admins:    map[string]bool{},
+		devs:      map[string]uint64{},
+		owners:    map[string][2]int{},
+		lstat:     map[string]fs.FileInfo{},
+		readDir:   map[string][]fs.DirEntry{},
+		removeErr: map[string]error{},
+		tempDir:   "/var/folders/ab/cdef12/T/",
+		clock:     time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC),
 	}
 }
 
@@ -431,6 +435,12 @@ func (f *fakeJobUsers) Rename(oldPath, newPath string) error {
 }
 func (f *fakeJobUsers) RemoveAll(path string) error {
 	f.record("removeall " + path)
+	f.mu.Lock()
+	err, ok := f.removeErr[path]
+	f.mu.Unlock()
+	if ok {
+		return err
+	}
 	return os.RemoveAll(path)
 }
 func (f *fakeJobUsers) MkdirAll(path string, perm fs.FileMode) error { return os.MkdirAll(path, perm) }

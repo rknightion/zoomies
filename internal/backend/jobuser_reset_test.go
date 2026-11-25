@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -532,5 +533,36 @@ func TestResetStillFailsWhenFindFailsForAnyOtherReason(t *testing.T) {
 	x.f.answerCode(1, "find: /Library/Caches/com.apple.x: Operation not permitted\nfind: /Library/Caches/build: Directory not empty\n", "/usr/bin/find", "-x", "-P", "/Library/Caches")
 	if err := x.u.removeSharedFiles(context.Background(), x.u.slotNamed("zj01")); err == nil {
 		t.Error("find failing to delete a job's folder was taken as a clean reset")
+	}
+}
+
+func TestResetLeavesWhatMacOSWillNotLetRootRemoveFromTheTemporaryFolder(t *testing.T) {
+	// macOS makes 0/com.apple.LaunchServices.dv in the folder for each user and
+	// protects it even from root. Failing the reset on it took every job user
+	// out of service after its first job on a real Mac.
+	x := startedJobUserFixture(t, 1)
+	parent := "/var/folders/ab/cdef12"
+	dir, err := os.Lstat(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.f.lstat[parent] = dir
+	x.f.owners[parent] = [2]int{651, jobUserGID}
+	sub := func(name string) fs.DirEntry { return fs.FileInfoToDirEntry(namedInfo{dir, name}) }
+	x.f.readDir[parent] = []fs.DirEntry{sub("0"), sub("T")}
+	x.f.readDir[parent+"/0"] = []fs.DirEntry{sub("com.apple.LaunchServices.dv")}
+	x.f.readDir[parent+"/T"] = []fs.DirEntry{sub("build")}
+	x.f.removeErr[parent+"/0/com.apple.LaunchServices.dv"] = &fs.PathError{Op: "openfdat", Path: parent + "/0/com.apple.LaunchServices.dv", Err: syscall.EPERM}
+	if err := x.u.removeUserTemp(context.Background(), x.u.slotNamed("zj01")); err != nil {
+		t.Fatalf("a folder macOS protects failed the reset: %v", err)
+	}
+	if x.f.indexOf("removeall "+parent+"/T/build") < 0 {
+		t.Errorf("the job's own folder was left: %v", x.f.logged())
+	}
+
+	// Any other failure still fails it.
+	x.f.removeErr[parent+"/T/build"] = &fs.PathError{Op: "unlinkat", Path: parent + "/T/build", Err: syscall.EBUSY}
+	if err := x.u.removeUserTemp(context.Background(), x.u.slotNamed("zj01")); err == nil {
+		t.Error("a folder that could not be removed for another reason was taken as clean")
 	}
 }
