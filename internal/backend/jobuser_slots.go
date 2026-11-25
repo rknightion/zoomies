@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -586,7 +587,18 @@ func (u *jobUsers) createAccount(ctx context.Context, s *jobUserSlot) error {
 	return nil
 }
 
-// parseJobUserProcesses reads ps -ax -o pid=,ruid=,uid=.
+// jobUserPsColumns is what ps is asked to print, one row for each process, and
+// what parseJobUserProcesses reads: pid, real user, effective user, percent of
+// one CPU and resident memory in KiB. The equals signs drop the header.
+const jobUserPsColumns = "pid=,ruid=,uid=,pcpu=,rss="
+
+// parseJobUserProcesses reads ps -ax -o jobUserPsColumns.
+//
+// The three ids are strict: whose process it is decides what a reset kills and
+// whether a slot is judged empty. The two usage figures are not: they only
+// decorate a sample, and a figure ps will not give (or gives as something that
+// is not a sane number) is read as zero rather than failing the whole listing
+// and, with it, a job's clean-up.
 func parseJobUserProcesses(out string) ([]jobUserProc, error) {
 	var procs []jobUserProc
 	for _, line := range strings.Split(out, "\n") {
@@ -594,7 +606,7 @@ func parseJobUserProcesses(out string) ([]jobUserProc, error) {
 		if len(f) == 0 {
 			continue
 		}
-		if len(f) != 3 {
+		if len(f) != 5 {
 			return nil, fmt.Errorf("ps printed a line this version of Zoomies cannot read: %q", line)
 		}
 		var v [3]int
@@ -605,7 +617,14 @@ func parseJobUserProcesses(out string) ([]jobUserProc, error) {
 			}
 			v[i] = n
 		}
-		procs = append(procs, jobUserProc{PID: v[0], RUID: v[1], EUID: v[2]})
+		p := jobUserProc{PID: v[0], RUID: v[1], EUID: v[2]}
+		if cpu, err := strconv.ParseFloat(f[3], 64); err == nil && cpu >= 0 && !math.IsInf(cpu, 0) {
+			p.CPUPercent = cpu
+		}
+		if kib, err := strconv.ParseInt(f[4], 10, 64); err == nil && kib >= 0 && kib <= math.MaxInt64>>10 {
+			p.RSSBytes = kib << 10
+		}
+		procs = append(procs, p)
 	}
 	return procs, nil
 }

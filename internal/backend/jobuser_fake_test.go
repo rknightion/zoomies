@@ -37,6 +37,8 @@ type fakeJobUsers struct {
 	homeOf  map[string]string
 	admins  map[string]bool
 	procs   []jobUserProc
+	// procsErr makes the process listing fail, as ps does when it cannot be run.
+	procsErr error
 	// stubborn keeps every process alive through pkill, so a reset has to give up.
 	stubborn bool
 	// ignoreUID makes sysadminctl hand out the next free UID from 503 whatever
@@ -486,6 +488,9 @@ func (f *fakeJobUsers) Mounts() ([]jobUserMount, error) {
 func (f *fakeJobUsers) Processes(context.Context) ([]jobUserProc, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.procsErr != nil {
+		return nil, f.procsErr
+	}
 	return append([]jobUserProc(nil), f.procs...), nil
 }
 

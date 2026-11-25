@@ -121,6 +121,13 @@ The group is `_zjobs` (GID 650).
 The controller leaves the capacity of this host alone: it is sized by the accounts,
 not by the Mac's cores and memory, so `auto_adjust` does not apply.
 
+Each running job still reports its CPU and memory, as a container does. The agent
+adds up every process its account is running: CPU as percent of one CPU (a job
+using two cores reads about 200) and the resident memory of those processes, which
+counts a page two of them share twice. CPU is the figure `ps` gives, which macOS
+smooths over the process's recent past, so it lags a sudden change. Memory has no
+limit to compare against, so only the use is shown.
+
 ## Checking it works
 
 Run a probe workflow on the host's label that runs two jobs one after the other.

@@ -33,6 +33,12 @@ type jobUserResult struct {
 // started it.
 type jobUserProc struct {
 	PID, RUID, EUID int
+	// CPUPercent is ps's pcpu: percent of one CPU, so a process using two cores
+	// reads about 200. It is the kernel's smoothed figure, not a rate over an
+	// interval of ours.
+	CPUPercent float64
+	// RSSBytes is the process's resident memory.
+	RSSBytes int64
 }
 
 // jobUserMount is one mounted filesystem: where it is mounted, and the user who

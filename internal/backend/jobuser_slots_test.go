@@ -225,15 +225,39 @@ func TestEnsureSlotsRefusesWhenItCannotTellWhetherAnAccountIsAnAdministrator(t *
 }
 
 func TestParseJobUserProcessesReadsPsAndRefusesWhatItCannotRead(t *testing.T) {
-	procs, err := parseJobUserProcesses("  1     0     0\n 4242   651   650\n")
-	if err != nil || len(procs) != 2 || procs[1] != (jobUserProc{PID: 4242, RUID: 651, EUID: 650}) {
-		t.Fatalf("got %v, %v", procs, err)
+	procs, err := parseJobUserProcesses("  1     0     0   0.0  1280\n 4242   651   650  12.5 20480\n")
+	want := jobUserProc{PID: 4242, RUID: 651, EUID: 650, CPUPercent: 12.5, RSSBytes: 20480 << 10}
+	if err != nil || len(procs) != 2 || procs[1] != want {
+		t.Fatalf("got %v, %v; want the second to be %+v", procs, err, want)
 	}
-	if _, err := parseJobUserProcesses("12 x 0\n"); err == nil {
-		t.Error("a line that is not numbers was read")
+	if _, err := parseJobUserProcesses("12 x 0 0.0 1\n"); err == nil {
+		t.Error("a line whose user is not a number was read")
 	}
-	if _, err := parseJobUserProcesses("12 0\n"); err == nil {
+	if _, err := parseJobUserProcesses("12 0 0\n"); err == nil {
 		t.Error("a short line was read")
+	}
+	if _, err := parseJobUserProcesses("12 0 0 0.0 1 2\n"); err == nil {
+		t.Error("a long line was read")
+	}
+}
+
+// Whose process it is decides what is killed and what a slot is judged to hold.
+// How much it is using only decorates a sample, so a figure ps will not give
+// must not make the listing, and with it a job's clean-up, fail.
+func TestParseJobUserProcessesReadsAProcessWhoseUsageItCannotRead(t *testing.T) {
+	for _, tc := range []struct{ name, line string }{
+		{"a missing figure", "4242 651 651 - -"},
+		{"a figure that is not a number", "4242 651 651 NaN x"},
+		{"a negative figure", "4242 651 651 -3.0 -5"},
+		{"an infinite figure", "4242 651 651 Inf x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			procs, err := parseJobUserProcesses(tc.line + "\n")
+			want := jobUserProc{PID: 4242, RUID: 651, EUID: 651}
+			if err != nil || len(procs) != 1 || procs[0] != want {
+				t.Fatalf("got %v, %v; want the process with its ids and no usage", procs, err)
+			}
+		})
 	}
 }
 

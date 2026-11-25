@@ -136,7 +136,7 @@ func (darwinJobUserSystem) ReadFile(path string, max int64) ([]byte, error) {
 }
 
 func (s darwinJobUserSystem) Processes(ctx context.Context) ([]jobUserProc, error) {
-	res, err := s.Run(ctx, jobUserCommand{Argv: []string{"/bin/ps", "-ax", "-o", "pid=,ruid=,uid="}})
+	res, err := s.Run(ctx, jobUserCommand{Argv: []string{"/bin/ps", "-ax", "-o", jobUserPsColumns}})
 	if err != nil {
 		return nil, err
 	}

@@ -631,7 +631,14 @@ func (b *ProcessBackend) Status(ctx context.Context, h Handle) (Status, error) {
 // Stats samples the runner's memory on Linux, where /proc makes it free. CPU is
 // left at zero: sampling it properly means holding state between calls, and the
 // host's own tooling already does that better.
+//
+// A job-user host is the exception, on any system: the job is everything its
+// account runs, so both figures are read from the process list (see
+// jobUserStats).
 func (b *ProcessBackend) Stats(ctx context.Context, h Handle) (Stats, error) {
+	if b.jobUsers != nil {
+		return b.jobUserStats(ctx, string(h)), nil
+	}
 	pid := readPID(string(h))
 	if pid <= 0 || runtime.GOOS != "linux" {
 		return Stats{}, nil

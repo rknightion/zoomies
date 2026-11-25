@@ -375,6 +375,50 @@ func (b *ProcessBackend) finishJobUser(ctx context.Context, dir string) error {
 	return nil
 }
 
+// jobUserStats is Stats in job-user mode. A job runs entirely as its slot's
+// account, so its usage is the sum over every process that account owns, real
+// or effective: the runner, the steps it starts and whatever they leave behind.
+// That is what a container's cgroup would have said, and it works on a Mac,
+// which has no /proc and no cgroup.
+//
+// CPU is ps's figure, percent of one CPU, which is the unit the container
+// backends report (a job using two cores reads about 200), so the controller
+// reads both alike. It is the kernel's smoothed figure, not a rate over an
+// interval of ours, which keeps this free of state between samples. Memory is
+// the sum of resident sets, which counts a page shared between two processes
+// twice; for sizing advice that errs towards too much, which is the safe side.
+//
+// It is best effort, as the interface asks: a runner no slot holds (its job
+// has ended and the account is given back), a ps that will not run or an
+// account running nothing all report nothing, and never an error.
+func (b *ProcessBackend) jobUserStats(ctx context.Context, dir string) Stats {
+	u := b.jobUsers
+	var slot *jobUserSlot
+	u.mu.Lock()
+	for _, s := range u.slots {
+		if s.holder == dir {
+			slot = s
+			break
+		}
+	}
+	u.mu.Unlock()
+	if slot == nil {
+		return Stats{}
+	}
+	procs, err := u.processesOf(ctx, slot.uid)
+	if err != nil || len(procs) == 0 {
+		return Stats{}
+	}
+	var out Stats
+	for _, p := range procs {
+		out.CPUPercent += p.CPUPercent
+		out.MemoryBytes += p.RSSBytes
+	}
+	at := u.now()
+	out.SampledAt = &at
+	return out
+}
+
 // pruneJobUserDiag deletes the oldest folders of kept diagnostics beyond keep.
 func pruneJobUserDiag(dir string, keep int, log *slog.Logger) {
 	entries, err := os.ReadDir(dir)
